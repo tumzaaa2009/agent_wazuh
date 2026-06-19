@@ -1,0 +1,50 @@
+#!/var/ossec/framework/python/bin/python3
+import sys
+import json
+import requests
+
+API_URL = "https://rh4cloudcenter.moph.go.th/api/v1/alerts"
+API_KEY = "KEY_141"
+
+def main():
+    with open("/var/ossec/logs/integrations.log", "a") as log:
+        log.write(f"custom-soc triggered with args: {sys.argv}\n")
+
+    if len(sys.argv) < 2:
+        return
+
+    alert_file = sys.argv[1]
+    try:
+        with open(alert_file, "r") as f:
+            alert = json.load(f)
+    except Exception as e:
+        with open("/var/ossec/logs/integrations.log", "a") as log:
+            log.write(f"Error loading JSON: {e}\n")
+        return
+
+    rule_level = alert.get("rule", {}).get("level", 0)
+
+    if int(rule_level) > 5:
+        payload = alert.copy()
+        payload["hospital_code"] = "141"
+        try:
+            r = requests.post(
+                API_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {API_KEY}", 
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"   # <--- เพิ่มบรรทัดนี้ลงไป
+                },
+                timeout=10,
+                verify=False
+            )
+
+            with open("/var/ossec/logs/integrations.log", "a") as log:
+                log.write(f"Sent alert. Response: {r.status_code}\n")
+        except Exception as e:
+            with open("/var/ossec/logs/integrations.log", "a") as log:
+                log.write(f"Error sending custom-soc alert: {e}\n")
+
+if __name__ == "__main__":
+    main()
