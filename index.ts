@@ -23,30 +23,32 @@ async function processQueueItem(item: any, ws?: WebSocket) {
       console.log(`🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`);
       
       try {
+         const actualTimeout = timeout || 3600;
          if (agent_id === "000") {
-             // 1. Wazuh Manager (Agent 000): Use local log file injection to trigger native local rule
-             const logEntry = {
-                timestamp: new Date().toISOString(),
-                source: "central_soc",
-                command: "firewall-drop",
-                srcip: srcip,
-                timeout: timeout || 3600,
-                log_id: log_id,
-                agent: { id: "000", name: agent_name || "Manager" }
-             };
-             await appendFile('/var/log/soc/active_response.log', JSON.stringify(logEntry) + '\\n');
-             console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
+            // For Manager (000), agent_control has issues in Wazuh 4.x.
+            // We append a custom log to trigger the localfile rule 100100 natively.
+            const logEntry = {
+               timestamp: new Date().toISOString(),
+               source: "central_soc",
+               command: "firewall-drop",
+               srcip: srcip,
+               timeout: actualTimeout.toString(),
+               log_id: log_id
+            };
+            await appendFile('/var/ossec/logs/active-responses.log', JSON.stringify(logEntry) + '\n');
+            console.log(`[${new Date().toISOString()}] ✅ Successfully triggered firewall-drop locally on agent 000 via localfile rule for IP ${srcip}`);
          } else {
-             // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
-             const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-             const match = arOutput.match(/Response name: (firewall-drop\\d*)/);
-             const arName = match ? match[1] : 'firewall-drop';
-             
-             await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-             console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
+            // 1. Get the exact Active Response name available in Wazuh Manager
+            const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
+            const match = arOutput.match(/Response name: (firewall-drop\d*)/);
+            const arName = match ? match[1] : 'firewall-drop';
+            
+            // 2. Execute the block specifically on the targeted agent
+            await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
+            console.log(`[${new Date().toISOString()}] ✅ Successfully triggered ${arName} on agent ${agent_id} to block ${srcip}`);
          }
       } catch (err) {
-         console.error(`❌ Failed to trigger active response via agent_control:`, err);
+         console.error(`[${new Date().toISOString()}] ❌ Failed to trigger active response:`, err);
       }
 
       // Send ACK back if WebSocket is provided
