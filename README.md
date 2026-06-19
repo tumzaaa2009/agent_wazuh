@@ -18,7 +18,7 @@
 # Wazuh/Indexer Pull Configuration (Local to the Hospital)
 INDEXER_URL="https://209.15.115.141:9200"
 INDEXER_USER="admin"
-INDEXER_PASSWORD="9Eq4aOlKbRvc0egujQH2UnP9bY0x?F+P"
+INDEXER_PASSWORD="asdasdasdasdsadasd"
 
 # Central SOC Configuration
 WS_URL=wss://rh4cloudcenter.moph.go.th/ws/active-response
