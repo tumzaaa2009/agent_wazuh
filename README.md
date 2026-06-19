@@ -5,8 +5,9 @@
 ---
 
 ## 🛠️ ส่วนที่ 1: ขั้นตอนการติดตั้งสำหรับหน่วยบริการใหม่ (Installation Guide)
-
-### 1. ตั้งค่าการอ่าน Log และ Active Response ใน Wazuh (`ossec.conf`)
+### 1. custom-soc เอาไฟล์ไปไว้ใน /var/ossec/etc/integration/ กำหนด สิทธิ์ของไฟล์ chown root:wazuh , chmod 750  , API_KEY เขตจะเจนให้ 
+        1.1 
+### 2. ตั้งค่าการอ่าน Log และ Active Response ใน Wazuh (`ossec.conf`)
 เปิดไฟล์ `/var/ossec/etc/ossec.conf` แล้วตรวจสอบและนำโค้ดนี้ไปวางไว้ก่อนปิด Tag `</ossec_config>` สุดท้ายของไฟล์:
 
 ```xml
