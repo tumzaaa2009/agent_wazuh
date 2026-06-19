@@ -1,0 +1,13 @@
+{
+  "name": "hospital-edge-connector",
+  "version": "1.0.0",
+  "description": "Lightweight WebSocket client to receive Active Response commands from Central SOC",
+  "main": "index.ts",
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

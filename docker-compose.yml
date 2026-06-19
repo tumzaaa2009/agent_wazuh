@@ -1,0 +1,11 @@
+services:
+  edge-connector:
+    build: .
+    container_name: hospital-edge-connector
+    restart: unless-stopped
+    network_mode: "host"
+    privileged: true
+    volumes:
+      - /var/ossec:/var/ossec
+    env_file:
+      - .env
