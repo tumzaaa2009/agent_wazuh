@@ -6,7 +6,25 @@
 
 ## 🛠️ ส่วนที่ 1: ขั้นตอนการติดตั้งสำหรับหน่วยบริการใหม่ (Installation Guide)
 ### 1. custom-soc เอาไฟล์ไปไว้ใน /var/ossec/etc/integration/ กำหนด สิทธิ์ของไฟล์ chown root:wazuh , chmod 750  , API_KEY เขตจะเจนให้ 
-        1.1 
+        1.1 เปลี่ยนชื่อ .env.hos --> .env โดยตั้งตัวแปรตาม นี้ ตัวแปรเป็นภาษาอังกฤษหมด
+                HOSPITAL_CODE=141
+                HOSPITAL_NAME="Hospital 141"
+                PROVINCE="Bangkok"
+                #default
+                ZONE="Zone 1"  
+                #Generate By Ket 4 
+                API_KEY="ket จะเจนให้"
+
+# Wazuh/Indexer Pull Configuration (Local to the Hospital)
+INDEXER_URL="https://209.15.115.141:9200"
+INDEXER_USER="admin"
+INDEXER_PASSWORD="9Eq4aOlKbRvc0egujQH2UnP9bY0x?F+P"
+
+# Central SOC Configuration
+WS_URL=wss://rh4cloudcenter.moph.go.th/ws/active-response
+API_URL="https://rh4cloudcenter.moph.go.th/api/v1"
+
+        
 ### 2. ตั้งค่าการอ่าน Log และ Active Response ใน Wazuh (`ossec.conf`)
 เปิดไฟล์ `/var/ossec/etc/ossec.conf` แล้วตรวจสอบและนำโค้ดนี้ไปวางไว้ก่อนปิด Tag `</ossec_config>` สุดท้ายของไฟล์:
 
