@@ -18,47 +18,60 @@ import { appendFile } from "fs/promises";
 async function processQueueItem(item: any, ws?: WebSocket) {
   const { id: log_id, command, srcip, timeout, agent_id, agent_name } = item;
 
+  const API_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "/api/v1");
+
+  // Send ACK Received via API
+  fetch(`${API_BASE_URL}/active-response/receive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
+  }).catch(err => console.error("Failed to send receive ACK:", err));
+
   if (command === "soc-firewall-drop" || command === "firewall-drop") {
     if (srcip && agent_id) {
       console.log(`🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`);
       
       try {
-         const actualTimeout = timeout || 3600;
          if (agent_id === "000") {
-            // For Manager (000), agent_control has issues in Wazuh 4.x.
-            // We append a custom log to trigger the localfile rule 100100 natively.
-            const logEntry = {
-               timestamp: new Date().toISOString(),
-               source: "central_soc",
-               command: "firewall-drop",
-               srcip: srcip,
-               timeout: actualTimeout.toString(),
-               log_id: log_id
-            };
-            await appendFile('/var/ossec/logs/active-responses.log', JSON.stringify(logEntry) + '\n');
-            console.log(`[${new Date().toISOString()}] ✅ Successfully triggered firewall-drop locally on agent 000 via localfile rule for IP ${srcip}`);
+             // 1. Wazuh Manager (Agent 000): Use local log file injection to trigger native local rule
+             const logEntry = {
+                timestamp: new Date().toISOString(),
+                source: "central_soc",
+                command: "firewall-drop",
+                srcip: srcip,
+                timeout: timeout || 3600,
+                log_id: log_id,
+                agent: { id: "000", name: agent_name || "Manager" }
+             };
+             await appendFile('/var/log/soc/active_response.log', JSON.stringify(logEntry) + '\\n');
+             console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
          } else {
-            // 1. Get the exact Active Response name available in Wazuh Manager
-            const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-            const match = arOutput.match(/Response name: (firewall-drop\d*)/);
-            const arName = match ? match[1] : 'firewall-drop';
-            
-            // 2. Execute the block specifically on the targeted agent
-            await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-            console.log(`[${new Date().toISOString()}] ✅ Successfully triggered ${arName} on agent ${agent_id} to block ${srcip}`);
+             // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
+             const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
+             const match = arOutput.match(/Response name: (firewall-drop\\d*)/);
+             const arName = match ? match[1] : 'firewall-drop';
+             
+             await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
+             console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
          }
       } catch (err) {
-         console.error(`[${new Date().toISOString()}] ❌ Failed to trigger active response:`, err);
+         console.error(`❌ Failed to trigger active response via agent_control:`, err);
       }
 
       // Send ACK back if WebSocket is provided
       if (ws) {
         const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id };
         ws.send(JSON.stringify(ackMsg));
-      } else {
-        // HTTP REST API processing (Optional)
-        console.log(`✅ Queue item ${log_id} processed. (Ready for HTTP ACK)`);
       }
+      
+      // Send HTTP REST API ACK for success
+      fetch(`${API_BASE_URL}/active-response/success`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
+      }).catch(err => console.error("Failed to send success ACK:", err));
+      
+      console.log(`✅ Queue item ${log_id} processed. (Sent HTTP ACK)`);
     } else {
       console.error(`⚠️ Cannot drop firewall: Missing srcip (${srcip}) or agent_id (${agent_id})`);
     }

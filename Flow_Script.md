@@ -82,7 +82,7 @@ Edge Connector ทำการเชื่อมต่อ WebSocket ไปยั
 }
 ```
 
-**Payload ขาตอบกลับ (จาก Edge Connector -> SOC) เพื่อ Ack ว่ารับคำสั่งแล้ว:**
+**Payload ขาตอบกลับ (จาก Edge Connector -> SOC) แบบ WebSocket เพื่อ Ack สถานะ:**
 ```json
 {
   "type": "ack",
@@ -92,7 +92,28 @@ Edge Connector ทำการเชื่อมต่อ WebSocket ไปยั
 }
 ```
 
-### 2.2 การดึงข้อมูลผ่าน REST API (Polling) - ทางเลือก
+### 2.2 การตอบกลับสถานะผ่าน HTTP REST API (Status Callback)
+นอกจากการส่งผ่าน WebSocket แล้ว Edge Connector ยังสามารถยิง API แจ้งสถานะกลับไปยัง SOC แบบละเอียดได้:
+
+**1. แจ้งว่าได้รับคำสั่ง (Received):**
+`POST https://rh4cloudcenter.moph.go.th/api/v1/active-response/receive`
+```json
+{
+  "log_id": 9999,
+  "hospital_code": "141"
+}
+```
+
+**2. แจ้งว่าบล็อกสำเร็จ (Success/Executed):**
+`POST https://rh4cloudcenter.moph.go.th/api/v1/active-response/success`
+```json
+{
+  "log_id": 9999,
+  "hospital_code": "141"
+}
+```
+
+### 2.3 การดึงข้อมูลคิวผ่าน REST API (Polling) - ทางเลือก
 หากไม่ใช้ WebSocket สามารถใช้ API ดึงคิวงาน (Queue) มาประมวลผลแทนได้ โดยใช้ `GET` ไปที่ Endpoint:
 `https://rh4cloudcenter.moph.go.th/api/v1/active-response/queues?hospital_code={HOSPITAL_CODE}`
 และเคลียร์ Queue โดยใช้ `DELETE` เมื่อดำเนินการสำเร็จ
@@ -101,14 +122,19 @@ Edge Connector ทำการเชื่อมต่อ WebSocket ไปยั
 
 ## ⚙️ ส่วนที่ 3: กระบวนการประมวลผลฝั่ง Edge Connector สู่ Wazuh
 
-เพื่อลดปัญหาความเข้ากันได้ของระบบคำสั่ง Edge Connector จะไม่สั่งรัน Script โดยตรง แต่จะใช้การ**เขียน Log** เข้าสู่ Wazuh เพื่อให้ Manager ตรวจจับและสั่ง Block ผ่าน Flow มาตรฐาน:
+ระบบ Edge Connector ถูกออกแบบการทำงานเป็นแบบ **Hybrid** เพื่อรองรับการสั่งการทั้งลูกข่าย (Remote Agents) และเครื่องหลัก (Manager) ได้อย่างสมบูรณ์แบบ โดยมีกลไกดังนี้:
 
-1. **รับข้อมูลจาก SOC:** Edge Connector ได้รับคำสั่งบล็อก IP
-2. **เขียน Log ทันที:** โค้ดจะนำ IP และ Timestamp มาจัดรูปแบบ JSON แล้วเขียนบันทึกลงใน `/var/ossec/logs/active-responses.log` (ผ่าน Volume Mount)
-   *ตัวอย่างข้อมูลที่ถูกเขียน:*
-   `{"timestamp":"2026-06-19T10:00:00.000Z","source":"central_soc","command":"firewall-drop","srcip":"8.8.8.8","timeout":604800,"log_id":9999}`
-3. **Wazuh ตรวจจับ:** Wazuh Manager (ผ่าน localfile syslog) จะอ่าน Log นั้น, ถอดรหัสผ่าน JSON Decoder, และ Trigger เข้า Rule รหัส `100100`
-4. **ทำ Active Response:** Wazuh ยิงคำสั่ง `firewall-drop` เพื่อบล็อก IP นั้นด้วย iptables เป็นระยะเวลา 7 วัน (`604800`) ตามที่คอนฟิกไว้
+**กรณีที่ 1: สั่งบล็อกเครื่องลูกข่าย (Agent ID: 001, 002, ...)**
+1. **รับข้อมูลจาก SOC:** Edge Connector ได้รับคำสั่งบล็อก IP พร้อมระบุ `agent_id`
+2. **ส่งคำสั่งผ่านเครือข่าย Wazuh:** ระบบจะรันคำสั่ง `/var/ossec/bin/agent_control -b {IP} -f firewall-drop -u {agent_id}`
+3. **Agent ลูกข่ายทำงาน:** เครื่องลูกข่ายได้รับคำสั่ง บล็อก IP และเริ่มนับเวลาถอยหลังปลดบล็อก
+
+**กรณีที่ 2: สั่งบล็อกเครื่องหลัก (Agent ID: 000 / Manager)**
+เพื่อเลี่ยงข้อจำกัดการเชื่อมต่อภายในของ Manager เอง ระบบจะเปลี่ยนไปใช้วิธี **รันสคริปต์บล็อกโดยตรง (Direct Script Execution)** แทน:
+1. **รับข้อมูลจาก SOC:** Edge Connector ได้รับคำสั่งบล็อก IP โดยระบุ `agent_id: "000"`
+2. **รันสคริปต์แบบ Bypass:** โค้ดจะสร้าง Payload แล้วส่งเข้าสคริปต์ของ Wazuh โดยตรง (`/var/ossec/active-response/bin/firewall-drop`) ผ่านคำสั่ง `add` ตามด้วย `continue`
+3. **ผลลัพธ์:** สคริปต์จะทำการอัปเดต `iptables` ให้ทันทีโดยไม่ต้องรอระบบ wazuh-execd
+*(หมายเหตุ: การรันตรงแบบนี้จะทำให้ไม่มีการปลดบล็อก IP อัตโนมัติตาม Timeout ของระบบ Wazuh)*
 
 ---
 
