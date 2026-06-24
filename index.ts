@@ -48,7 +48,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
          } else {
              // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
              const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-             const match = arOutput.match(/Response name: (firewall-drop\\d*)/);
+             const match = arOutput.match(/Response name: (firewall-drop\d*)/);
              const arName = match ? match[1] : 'firewall-drop';
              
              await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
@@ -185,5 +185,5 @@ async function pollApiQueue() {
 connect();
 
 // Uncomment to enable HTTP API Polling every 10 seconds
-// setInterval(pollApiQueue, 10000);
+setInterval(pollApiQueue, 10000);
 

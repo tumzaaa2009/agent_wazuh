@@ -22,6 +22,9 @@ def main():
             log.write(f"Error loading JSON: {e}\n")
         return
 
+    if "_source" in alert:
+        alert = alert["_source"]
+
     rule_level = alert.get("rule", {}).get("level", 0)
 
     if int(rule_level) > 5:
