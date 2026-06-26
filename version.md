@@ -3,8 +3,12 @@
 เอกสารนี้ใช้สำหรับติดตามประวัติการอัปเดตและฟีเจอร์ที่ถูกปรับปรุงในแต่ละเวอร์ชันของ Edge Connector ครับ
 
 ---
+## 📡 v1.2.1 (Latest) - HTTP REST API Success ACK
+**Date:** 2026-06-20
+- 🌐 **Bug Fix agent ไม่ดึง Rule ของส่วนกลาง
 
-## 📡 v1.2.0 (Latest) - HTTP REST API Success ACK
+---
+## 📡 v1.2.0  - HTTP REST API Success ACK
 **Date:** 2026-06-20
 - 🌐 **Add HTTP Success Callback:** เพิ่มการยิง API แจ้งเตือนสถานะความสำเร็จ (`active-response/success`) กลับไปยังฝั่ง Core/Central SOC ทันทีหลังจากที่ Edge Connector บล็อก IP เรียบร้อยแล้ว เพื่อให้ Dashboard ฝั่งส่วนกลางอัปเดตสถานะแบบ Real-time
 

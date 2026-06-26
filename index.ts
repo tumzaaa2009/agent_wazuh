@@ -43,7 +43,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
                 log_id: log_id,
                 agent: { id: "000", name: agent_name || "Manager" }
              };
-             await appendFile('/var/log/soc/active_response.log', JSON.stringify(logEntry) + '\\n');
+             await appendFile('/var/ossec/logs/active-responses.log', JSON.stringify(logEntry) + '\n');
              console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
          } else {
              // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
