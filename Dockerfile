@@ -4,8 +4,14 @@ WORKDIR /app
 
 COPY package.json index.ts ./
 
-# Install iptables for blocking functionality
-RUN apt-get update && apt-get install -y iptables && rm -rf /var/lib/apt/lists/*
+# Install necessary system dependencies (curl for healthcheck, iptables for firewall-drop, yara for scanning, unzip for configs)
+RUN apt-get update && apt-get install -y \
+    curl \
+    iptables \
+    yara \
+    unzip \
+    systemd \
+    && rm -rf /var/lib/apt/lists/*
 
 # Add wazuh user and group to match host for agent_control permissions
 RUN groupadd -g 125 wazuh && useradd -u 115 -g 125 -s /sbin/nologin wazuh

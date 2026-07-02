@@ -1,64 +1,46 @@
 # 🚀 Hospital Edge Connector - Workflow, API Reference & Installation Guide
 
-เอกสารนี้อธิบายรูปแบบข้อมูล การทำงาน และขั้นตอนการติดตั้ง **Hospital Edge Connector (Agent)** สำหรับเชื่อมต่อกับ **Central SOC (ส่วนกลาง)** เพื่อรับคำสั่งทำ **Active Response** (Global Block IP)
+เอกสารนี้อธิบายรูปแบบข้อมูล การทำงาน และขั้นตอนการติดตั้ง **Hospital Edge Connector (Agent)** สำหรับเชื่อมต่อกับ **Central SOC (ส่วนกลาง)** เพื่อรับคำสั่งทำ **Active Response** (Global Block IP) และการทำ **Native YARA Scanning** แบบ Zero-Config
 
 ---
 
 ## 🛠️ ส่วนที่ 1: ขั้นตอนการติดตั้งสำหรับหน่วยบริการใหม่ (Installation Guide)
 
-### 1. ตั้งค่าการอ่าน Log และ Active Response ใน Wazuh (`ossec.conf`)
-เปิดไฟล์ `/var/ossec/etc/ossec.conf` แล้วตรวจสอบและนำโค้ดนี้ไปวางไว้ก่อนปิด Tag `</ossec_config>` สุดท้ายของไฟล์:
-
-```xml
-  <localfile>
-    <log_format>syslog</log_format>
-    <location>/var/ossec/logs/active-responses.log</location>
-  </localfile>
-
-  <active-response>
-    <command>firewall-drop</command>
-    <location>local</location>
-    <rules_id>100100</rules_id>
-    <timeout>604800</timeout> <!-- บล็อกเป็นเวลา 7 วัน -->
-  </active-response>
-```
-
-### 2. สร้าง Rule สำหรับดักจับคำสั่งบล็อกจาก SOC
-เปิดไฟล์ `/var/ossec/etc/rules/local_rules.xml` แล้วเพิ่ม Rule รหัส `100100` ลงไป:
-```xml
-<group name="local,syslog,">
-  <rule id="100100" level="10">
-    <decoded_as>json</decoded_as>
-    <field name="source">central_soc</field>
-    <field name="command">firewall-drop</field>
-    <description>Central SOC requested a firewall drop for IP: $(srcip)</description>
-    <mitre>
-      <id>T1036</id>
-    </mitre>
-  </rule>
-</group>
-```
-
-### 3. Restart Wazuh Manager
-เพื่อให้การตั้งค่าทั้งหมดมีผล ให้รันคำสั่ง:
+### 1. ดาวน์โหลดและแตกไฟล์ Hospital Edge Connector
+โหลดไฟล์แพ็กเกจจากศูนย์กลาง ซึ่งจะมี Source Code และเครื่องมือทุกอย่างครบถ้วน:
 ```bash
-systemctl restart wazuh-manager
+wget https://rh4cloudcenter.moph.go.th/api/v1/yara-rules/hospital_edge_connector.zip
+unzip hospital_edge_connector.zip
+cd agent_wazuh
 ```
 
-### 4. ติดตั้งและตั้งค่า Edge Connector
-นำ Source Code ของ Edge Connector ไปวางที่หน่วยบริการ (เช่น `/var/hospital-edge-connector`)
-1. แก้ไขไฟล์ `.env` ให้ตรงกับข้อมูลของโรงพยาบาล:
-   ```env
-   HOSPITAL_CODE=รหัสโรงพยาบาล
-   API_KEY=API_KEYของโรงพยาบาลนั้น
-   ```
-2. สั่งรัน Docker Container:
-   ```bash
-   cd /var/hospital-edge-connector
-   docker compose up -d --build
-   ```
+### 2. ตั้งค่าการเชื่อมต่อ (Edit `.env`)
+เปิดไฟล์ `.env` ขึ้นมา แล้วแก้ไขค่าให้ตรงกับข้อมูลของโรงพยาบาล:
+```env
+HOSPITAL_CODE=รหัสโรงพยาบาล (เช่น 141)
+HOSPITAL_NAME=ชื่อโรงพยาบาล
+API_KEY=API_KEYสำหรับเชื่อมต่อส่วนกลาง
+```
 
-**(เสร็จสิ้นการติดตั้ง! ระบบพร้อมทำงานและดึง Queue มาบล็อกทันที)**
+### 3. ตั้งค่าระบบ Wazuh (แค่ครั้งเดียว)
+เปิดไฟล์ `/var/ossec/etc/ossec.conf` ของเครื่อง SIEM โรงพยาบาล แล้วนำโค้ดในไฟล์ **`agent_mockup.xml`** ไปแปะไว้ก่อนปิด Tag `</ossec_config>` ในไฟล์
+
+*(หมายเหตุ: โรงพยาบาลไม่ต้องสร้าง Rule หรือ Decoder ใดๆ ด้วยตัวเอง เพราะระบบ Edge Connector จะเป็นคนดึง Rule จากศูนย์กลางมาลงให้ในขั้นตอนถัดไป)*
+
+### 4. ติดตั้งสคริปต์ YARA Quarantine (ทางเลือก)
+หากต้องการให้ระบบ "กักกัน/ลบมัลแวร์" โดยอัตโนมัติ ให้ก๊อปปี้ไฟล์สคริปต์ไปไว้ในโฟลเดอร์ Active Response:
+```bash
+cp deploy_yara_windows.ps1 deploy_yara_linux.sh /var/ossec/active-response/bin/
+chmod 750 /var/ossec/active-response/bin/deploy_yara_linux.sh
+```
+
+### 5. สั่งรัน Edge Connector
+เริ่มการทำงานของ Edge Connector ซึ่งจะไปดึง Rule แรกเริ่มมาทับลง Wazuh ให้ทันที:
+```bash
+docker compose up -d --build
+```
+
+**(เสร็จสิ้นการติดตั้ง! ระบบพร้อมทำงาน ดึง Rule อัตโนมัติ และเชื่อมต่อ WebSocket ทันที)**
 
 ---
 
@@ -78,6 +60,19 @@ Edge Connector ทำการเชื่อมต่อ WebSocket ไปยั
     "arguments": ["8.8.8.8", "3600"],
     "agent_id": "001",
     "agent_name": "MophRh4"
+  }
+}
+```
+
+**Payload ขาเข้า (คำสั่งสแกน YARA):**
+```json
+{
+  "action": "execute_active_response",
+  "payload": {
+    "log_id": 10000,
+    "command": "yara-scan",
+    "arguments": ["/var/www/html/upload/shell.php"],
+    "agent_id": "000"
   }
 }
 ```
@@ -138,7 +133,32 @@ Edge Connector ทำการเชื่อมต่อ WebSocket ไปยั
 
 ---
 
-## 🔍 ส่วนที่ 4: วิธีการทดสอบแบบ End-to-End (Checklist)
+## 🦠 ส่วนที่ 4: กระบวนการทำงานของ YARA Native Scan และ Auto Quarantine (Full-Loop)
+
+ระบบมีความสามารถในการตรวจจับมัลแวร์ในตัวเอง และจัดการไฟล์อันตรายได้แบบ End-to-End พร้อมระบบรายงาน Hash:
+1. **Auto-Update YARA Rules (Sync):** ระบบ Edge Connector จะดึงไฟล์ YARA Rules ล่าสุดจาก `https://rh4cloudcenter.moph.go.th/api/v1/yara-rules` มาเก็บไว้ที่ `/var/ossec/etc/shared/default/yara_rules.yar` บน Host เพื่อให้ Wazuh ซิงก์ลงไปยัง Agent อัตโนมัติ
+2. **Global Drive Scanning:** ที่เครื่องลูกข่าย (Windows/Linux) ระบบ FIM จะเฝ้าระวังไฟล์รันเนเบิล (exe, dll ฯลฯ) ทันทีที่ไฟล์ตกถึงพื้น จะเรียกสคริปต์ YARA สแกนแบบออฟไลน์ด้วย Rule ล่าสุด
+3. **Auto Quarantine (ลบอัตโนมัติ):** เมื่อพบว่าเป็นมัลแวร์ สคริปต์ Active Response (เช่น `yara.sh`) จะสั่งลบไฟล์ต้นทางหรือกักกันทันที
+4. **Malware Hash Reporting (Threat Intel):** หลังจากลบสำเร็จ Edge Connector จะทำการ POST ข้อมูล Hash ของมัลแวร์นั้นๆ กลับไปที่ `https://rh4cloudcenter.moph.go.th/api/v1/malware-events` เพื่อนำไปอัปเดตเป็นฐานข้อมูล CDB ส่วนกลางของเขตสุขภาพต่อไป
+
+---
+
+## 🔄 ส่วนที่ 5: ระบบแจกจ่าย Rule และ Decoder อัตโนมัติ (Zero-Touch SOC Sync)
+
+Edge Connector จะทำหน้าที่ดึง Rule และ Decoder ใหม่ๆ จาก SOC มาติดตั้งที่โรงพยาบาลโดยอัตโนมัติ:
+1. แอดมินส่วนกลางเพิ่มไฟล์ที่ขึ้นต้นด้วย `soc_` (เช่น `soc_yara.xml`) เข้าโฟลเดอร์ส่วนกลาง
+2. Edge Connector จะดึงไฟล์ `soc_configs.zip` จาก `https://rh4cloudcenter.moph.go.th/api/v1/wazuh-configs` ทุกๆ 24 ชั่วโมง
+3. ระบบจะแตกไฟล์ลง `/var/ossec/etc/rules/` และ `/var/ossec/etc/decoders/`
+4. ทำการ Restart Wazuh Manager อัตโนมัติ เพื่อให้ Rule ชุดใหม่ทำงาน (โดยไม่กระทบ Rule เดิมของโรงพยาบาล)
+
+---
+
+## 🔍 ส่วนที่ 6: วิธีการทดสอบแบบ End-to-End (Checklist)
+
+### 🔑 ข้อมูลการเข้าถึง UAT (Hospital Edge SIEM)
+หากต้องการทดสอบหรือแก้บั๊กบนเครื่องจำลองของโรงพยาบาล (Hospital SIEM) สามารถเข้าผ่าน SSH ได้ดังนี้:
+- **IP / Port:** `209.15.115.141` พอร์ต `456`
+- **Username / Password:** `root` / `Su13540038`
 
 ### ขั้นที่ 1: ตรวจสอบการทำงานของ Edge Connector
 ```bash
@@ -149,9 +169,9 @@ docker logs --tail 20 hospital-edge-connector
 
 ### ขั้นที่ 2: ตรวจสอบว่า Rule ทำงานและเกิด Alert หรือไม่
 ```bash
-tail -f /var/ossec/logs/alerts/alerts.json | grep 100100
+tail -f /var/ossec/logs/alerts/alerts.json | grep 110100
 ```
-> **สิ่งที่ต้องเห็น:** แจ้งเตือนรูปแบบ JSON ที่มี `rule.id: "100100"` และ IP ที่ถูกสั่งบล็อก
+> **สิ่งที่ต้องเห็น:** แจ้งเตือนรูปแบบ JSON ที่มี `rule.id: "110100"` และ IP ที่ถูกสั่งบล็อก
 
 ### ขั้นที่ 3: ตรวจสอบ Active Response และ Iptables
 เมื่อ Alert ทำงาน Wazuh จะรันสคริปต์ Block ทันที

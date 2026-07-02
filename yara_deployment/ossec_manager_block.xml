@@ -1,0 +1,54 @@
+<!-- =============================================================
+     SOC Zone - Manager ossec.conf (YARA + Active Response Block)
+     
+     นำ Block นี้ไปวางใน ossec.conf ของ Manager (หน่วยบริการ)
+     ก่อนปิด Tag </ossec_config> สุดท้าย
+     
+     หมายเหตุ: ให้แน่ใจว่ามี Block นี้เพียง 1 ชุดเท่านั้น (ห้ามซ้ำ)
+     ============================================================= -->
+
+  <!-- ====== Command Definitions ====== -->
+
+  <!-- YARA for Linux Agents (ใช้ Docker Container) -->
+  <command>
+    <name>yara_linux</name>
+    <executable>yara.sh</executable>
+    <timeout_allowed>no</timeout_allowed>
+  </command>
+
+  <!-- YARA for Windows Agents (ใช้ yara64.exe ติดตั้งเอง) -->
+  <command>
+    <name>yara_windows</name>
+    <executable>yara.bat</executable>
+    <timeout_allowed>no</timeout_allowed>
+  </command>
+
+  <!-- ====== Active Response Triggers ====== -->
+
+  <!-- เมื่อ FIM ตรวจเจอไฟล์ใหม่/เปลี่ยนแปลง (Rule 554=New file, 550=Integrity checksum changed) -->
+  <!-- location=local = สคริปต์จะรันที่เครื่อง Agent ที่เจอไฟล์นั้นๆ โดยตรง -->
+  <active-response>
+    <command>yara_linux</command>
+    <location>local</location>
+    <rules_id>554, 550</rules_id>
+  </active-response>
+
+  <active-response>
+    <command>yara_windows</command>
+    <location>local</location>
+    <rules_id>554, 550</rules_id>
+  </active-response>
+
+  <!-- Firewall Drop (สั่งจาก SOC กลาง ผ่าน Edge Connector) -->
+  <active-response>
+    <command>firewall-drop</command>
+    <location>local</location>
+    <rules_id>110100</rules_id>
+    <timeout>604800</timeout>
+  </active-response>
+
+  <!-- ====== Log สำหรับเก็บผล Active Response ====== -->
+  <localfile>
+    <log_format>syslog</log_format>
+    <location>/var/ossec/logs/active-responses.log</location>
+  </localfile>
