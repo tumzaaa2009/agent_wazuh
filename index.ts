@@ -49,13 +49,13 @@ async function reportMalwareEvent(eventData: {
     console.log(`📤 Malware event reported to SOC: ${res.status}`);
     await appendFile('/var/ossec/logs/integrations.log',
       `[malware-event] ${payload.filepath} -> ${res.status}\n`
-    ).catch(() => {});
+    ).catch(() => { });
   } catch (err) {
     console.error("❌ Failed to report malware event to SOC:", err);
     // Log locally so we don't lose the event
     await appendFile('/var/ossec/logs/integrations.log',
       `[malware-event-fail] ${JSON.stringify(payload)}\n`
-    ).catch(() => {});
+    ).catch(() => { });
   }
 }
 
@@ -66,40 +66,40 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
   // Send ACK Received via API
   fetch(`${API_BASE_URL}/active-response/receive`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
   }).catch(err => console.error("Failed to send receive ACK:", err));
 
   if (command === "soc-firewall-drop" || command === "firewall-drop") {
     if (srcip && agent_id) {
       console.log(`🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`);
-      
+
       try {
-         if (agent_id === "000") {
-             // 1. Wazuh Manager (Agent 000): Use local log file injection to trigger native local rule
-             const logEntry = {
-                timestamp: new Date().toISOString(),
-                source: "central_soc",
-                command: "firewall-drop",
-                srcip: srcip,
-                timeout: timeout || 3600,
-                log_id: log_id,
-                agent: { id: "000", name: agent_name || "Manager" }
-             };
-             await appendFile('/var/ossec/logs/active-responses.log', JSON.stringify(logEntry) + '\n');
-             console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
-         } else {
-             // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
-             const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-             const match = arOutput.match(/Response name: (firewall-drop\d*)/);
-             const arName = match ? match[1] : 'firewall-drop';
-             
-             await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-             console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
-         }
+        if (agent_id === "000") {
+          // 1. Wazuh Manager (Agent 000): Use local log file injection to trigger native local rule
+          const logEntry = {
+            timestamp: new Date().toISOString(),
+            source: "central_soc",
+            command: "firewall-drop",
+            srcip: srcip,
+            timeout: timeout || 3600,
+            log_id: log_id,
+            agent: { id: "000", name: agent_name || "Manager" }
+          };
+          await appendFile('/var/ossec/logs/active-responses.log', JSON.stringify(logEntry) + '\n');
+          console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
+        } else {
+          // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
+          const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
+          const match = arOutput.match(/Response name: (firewall-drop\d*)/);
+          const arName = match ? match[1] : 'firewall-drop';
+
+          await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
+          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
+        }
       } catch (err) {
-         console.error(`❌ Failed to trigger active response via agent_control:`, err);
+        console.error(`❌ Failed to trigger active response via agent_control:`, err);
       }
 
       // Send ACK back if WebSocket is provided
@@ -107,14 +107,14 @@ async function processQueueItem(item: any, ws?: WebSocket) {
         const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id };
         ws.send(JSON.stringify(ackMsg));
       }
-      
+
       // Send HTTP REST API ACK for success
       fetch(`${API_BASE_URL}/active-response/success`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
       }).catch(err => console.error("Failed to send success ACK:", err));
-      
+
       console.log(`✅ Queue item ${log_id} processed. (Sent HTTP ACK)`);
     } else {
       console.error(`⚠️ Cannot drop firewall: Missing srcip (${srcip}) or agent_id (${agent_id})`);
@@ -131,7 +131,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
           const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
           const isWindows = infoOutput.toLowerCase().includes('windows');
           const arName = isWindows ? 'yara_windows' : 'yara_linux';
-          
+
           console.log(`📡 Agent ${agent_id} is ${isWindows ? 'Windows' : 'Linux'}. Triggering ${arName}...`);
           await $`/var/ossec/bin/agent_control -b ${filepath} -f ${arName} -u ${agent_id}`;
           yaraOutput = `Sent command ${arName} to agent ${agent_id} for file ${filepath}`;
@@ -173,7 +173,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
             console.log(`🟢 No malware found in ${filepath}`);
           }
         }
-        
+
         // Send ACK back if WebSocket is provided
         if (ws) {
           const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id, scan_result: yaraOutput };
@@ -182,9 +182,9 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
         // Send HTTP REST API ACK for success
         fetch(`${API_BASE_URL}/active-response/success`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE, scan_result: yaraOutput })
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE, scan_result: yaraOutput })
         }).catch(err => console.error("Failed to send success ACK:", err));
       } catch (err) {
         console.error(`❌ YARA Scan failed:`, err);
@@ -204,9 +204,9 @@ function connect() {
 
   ws.onopen = () => {
     console.log("✅ Connected to Central SOC WebSocket!");
-    
-    const registerMsg = { 
-      type: "register", 
+
+    const registerMsg = {
+      type: "register",
       hospital_code: HOSPITAL_CODE,
       hospital_name: HOSPITAL_NAME,
       province: PROVINCE,
@@ -267,7 +267,7 @@ function connect() {
 // ---------------------------------------------------------
 async function pollApiQueue() {
   const API_QUEUE_URL = process.env.API_QUEUE_URL || "https://rh4cloudcenter.moph.go.th/api/v1/active-response/queues";
-  
+
   try {
     const response = await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}`, {
       method: "GET",
@@ -282,7 +282,7 @@ async function pollApiQueue() {
           console.log(`🔄 Polled ${queues.length} items from API`);
           for (const item of queues) {
             await processQueueItem(item);
-            
+
             // Note: After processing, you should call DELETE API to clear the queue
             await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}&srcip=${item.srcip}`, {
               method: "DELETE",
@@ -306,7 +306,7 @@ async function fetchYaraRules() {
     console.log(`📥 Checking YARA rules version at ${YARA_API_URL}/version...`);
 
     const RULES_PATH = "/var/ossec/etc/shared/default/yara_rules.yar";
-    
+
     // Version check to avoid redundant downloads (bandwidth optimization)
     try {
       const versionRes = await fetch(`${YARA_API_URL}/version`, { signal: AbortSignal.timeout(5000) });
@@ -333,7 +333,7 @@ async function fetchYaraRules() {
               combinedRules += decodedContent + "\n";
             }
             await Bun.write(RULES_PATH, combinedRules);
-            await $`chown wazuh:wazuh ${RULES_PATH} && chmod 660 ${RULES_PATH}`.catch(() => {});
+            await $`chown wazuh:wazuh ${RULES_PATH} && chmod 660 ${RULES_PATH}`.catch(() => { });
             await Bun.write(versionFile, String(vData.version));
             console.log(`✅ Successfully updated YARA rules at ${RULES_PATH} (version: ${vData.version})`);
           }
@@ -359,7 +359,7 @@ async function fetchYaraRules() {
           combinedRules += decodedContent + "\n";
         }
         await Bun.write(RULES_PATH, combinedRules);
-        await $`chown wazuh:wazuh ${RULES_PATH} && chmod 660 ${RULES_PATH}`.catch(() => {});
+        await $`chown wazuh:wazuh ${RULES_PATH} && chmod 660 ${RULES_PATH}`.catch(() => { });
         console.log(`✅ Successfully updated YARA rules at ${RULES_PATH}`);
       }
     } else {
@@ -376,26 +376,26 @@ async function fetchYaraRules() {
 
 async function autoInjectWazuhConfigs(data: any) {
   if (!data.mockup_agent && !data.mockup_manager) return;
-  
+
   const ossecConfPath = '/var/ossec/etc/ossec.conf';
   const agentConfPath = '/var/ossec/etc/shared/default/agent.conf';
-  
+
   try {
     let confContent = await Bun.file(ossecConfPath).text();
     let agentConfContent = await Bun.file(agentConfPath).text();
     let needsRestart = false;
-    
+
     // In API v1/v2, data.mockup_agent is the FULL yara_deployment/agent.conf file.
     // data.mockup_manager is the FULL manager_mockup.xml file.
     let managerMockup = "";
     let agentMockup = "";
-    
+
     if (data.mockup_agent) {
-       agentMockup = Buffer.from(data.mockup_agent, 'base64').toString('utf-8');
+      agentMockup = Buffer.from(data.mockup_agent, 'base64').toString('utf-8');
     }
-    
+
     if (data.mockup_manager) {
-       managerMockup = Buffer.from(data.mockup_manager, 'base64').toString('utf-8');
+      managerMockup = Buffer.from(data.mockup_manager, 'base64').toString('utf-8');
     }
 
     // 1. Inject Manager Config (ossec.conf)
@@ -441,14 +441,14 @@ async function fetchSocConfigs() {
             return;
           }
         }
-        
+
         console.log(`📥 Updates found! Fetching latest SOC configs from ${SOC_CONFIG_URL}...`);
         const response = await fetch(SOC_CONFIG_URL);
         if (response.ok) {
           const data = await response.json();
           if (data.success) {
             console.log("📦 Extracting SOC configs to /var/ossec/etc/...");
-            
+
             // Write rules
             if (data.rules) {
               for (const rule of data.rules) {
@@ -458,7 +458,7 @@ async function fetchSocConfigs() {
                 await $`chown root:wazuh ${filepath} && chmod 750 ${filepath}`;
               }
             }
-            
+
             // Write decoders
             if (data.decoders) {
               for (const decoder of data.decoders) {
@@ -468,14 +468,14 @@ async function fetchSocConfigs() {
                 await $`chown root:wazuh ${filepath} && chmod 750 ${filepath}`;
               }
             }
-              
+
             // Save the new version
             await Bun.write('/var/ossec/etc/soc_rules_version.txt', vData.version);
             await $`chown root:wazuh /var/ossec/etc/soc_rules_version.txt && chmod 640 /var/ossec/etc/soc_rules_version.txt`;
-            
+
             // Auto inject configurations
             await autoInjectWazuhConfigs(data);
-            
+
             console.log("🔄 Restarting Wazuh Manager to apply new configs...");
             await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager`;
             console.log("✅ Wazuh configs synced successfully!");
@@ -496,8 +496,8 @@ async function fetchSocConfigs() {
 // Automated YARA WPK Deployment Orchestrator
 // ---------------------------------------------------------
 async function deployYaraWpk() {
-    // Deprecated: YARA deployment is now handled natively via Docker and agent.conf
-    return;
+  // Deprecated: YARA deployment is now handled natively via Docker and agent.conf
+  return;
 }
 
 
@@ -514,7 +514,7 @@ async function fetchPoliciesV2() {
       method: "GET",
       headers: { "Authorization": `Bearer ${API_KEY}` }
     });
-    
+
     if (response.ok) {
       const data = await response.json();
       if (data.success && data.policy) {
