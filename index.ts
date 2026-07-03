@@ -11,10 +11,49 @@ const INDEXER_USER = process.env.INDEXER_USER || "";
 const INDEXER_PASSWORD = process.env.INDEXER_PASSWORD || "";
 const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go.th/api/v1/yara-rules";
 
+import { appendFile } from "fs/promises";
+import { existsSync } from "fs";
+
+// Override console.log and console.error to write to separate log files
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+
+const logDir = "/app/logs";
+if (!existsSync(logDir)) {
+  import("fs").then(fs => fs.mkdirSync(logDir, { recursive: true })).catch(() => {});
+}
+
+async function writeLog(level: "INFO" | "ERROR", ...args: any[]) {
+  const msg = args.map(a => (typeof a === 'object' && a !== null) ? JSON.stringify(a) : String(a)).join(" ");
+  const timestamp = new Date().toISOString();
+  const logStr = `[${timestamp}] [${level}] ${msg}\n`;
+  
+  if (level === "ERROR") {
+    originalConsoleError(...args);
+  } else {
+    originalConsoleLog(...args);
+  }
+
+  let system = "system";
+  const lowerMsg = msg.toLowerCase();
+  
+  // Categorize log based on keywords
+  if (lowerMsg.includes("yara") || lowerMsg.includes("malware") || lowerMsg.includes("quarantine")) {
+    system = "yara";
+  } else if (lowerMsg.includes("soc configs") || lowerMsg.includes("wazuh") || lowerMsg.includes("mockup") || lowerMsg.includes("ossec.conf") || lowerMsg.includes("agent.conf") || lowerMsg.includes("policy")) {
+    system = "wazuh";
+  } else if (lowerMsg.includes("firewall") || lowerMsg.includes("active response") || lowerMsg.includes("queue item") || lowerMsg.includes("ack") || lowerMsg.includes("srcip")) {
+    system = "active-response";
+  }
+  
+  await appendFile(`${logDir}/${system}.log`, logStr).catch(() => {});
+}
+
+console.log = (...args) => { writeLog("INFO", ...args); };
+console.error = (...args) => { writeLog("ERROR", ...args); };
+
 console.log("🚀 Starting Hospital Edge Connector (Bun/TypeScript)...");
 console.log(`🏥 Hospital Code: ${HOSPITAL_CODE}`);
-
-import { appendFile } from "fs/promises";
 
 // ---------------------------------------------------------
 // Report Malware Event to Central SOC
