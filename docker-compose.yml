@@ -11,5 +11,7 @@ services:
       - ./logs:/app/logs
       - /run/dbus:/run/dbus
       - /run/systemd:/run/systemd
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
     env_file:
       - .env
