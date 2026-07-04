@@ -451,16 +451,25 @@ async function autoInjectWazuhConfigs(data: any) {
       managerMockup = Buffer.from(data.mockup_manager, 'base64').toString('utf-8');
     }
 
-    // 1. Inject Manager Config (ossec.conf)
-    if (!confContent.includes("custom-soc_engine") && !confContent.includes("custom-soc")) {
-      console.log("⚙️ Injecting manager mockup into ossec.conf...");
-      confContent = confContent.replace('</ossec_config>', `\n<!-- INJECTED BY EDGE CONNECTOR -->\n${managerMockup}\n</ossec_config>`);
+    // 1. Update Manager Config (ossec.conf) — remove old block, inject new
+    if (managerMockup) {
+      const START = '<!-- INJECTED BY EDGE CONNECTOR -->';
+      const END = '<!-- USER CUSTOM CONFIGURATION BLOCK ENDS HERE   -->';
+      const startIdx = confContent.indexOf(START);
+      const endIdx = confContent.indexOf(END);
+
+      // Remove existing injected block (if any)
+      if (startIdx !== -1 && endIdx !== -1) {
+        confContent = confContent.substring(0, startIdx) + confContent.substring(endIdx + END.length);
+      }
+
+      // Inject new block right before </ossec_config>
+      confContent = confContent.replace('</ossec_config>', `\n${managerMockup}\n</ossec_config>`);
+      
       await Bun.write(ossecConfPath, confContent);
       await $`chown root:wazuh ${ossecConfPath} && chmod 660 ${ossecConfPath}`;
       needsRestart = true;
-      console.log("✅ Manager injection complete.");
-    } else {
-      console.log("✅ Manager mockup already injected in ossec.conf.");
+      console.log("✅ Manager mockup updated in ossec.conf.");
     }
 
     // 2. Inject Agent Config (agent.conf)
