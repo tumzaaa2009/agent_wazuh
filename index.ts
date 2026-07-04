@@ -112,7 +112,10 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
   if (command === "soc-firewall-drop" || command === "firewall-drop") {
     if (srcip && agent_id) {
-      console.log(`🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`);
+      const dropMsg = `🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`;
+      console.log(dropMsg);
+      // ส่งเข้า syslog
+      await $`logger -t HOS-Edge-Connector ${dropMsg}`.catch((err: any) => console.error("Syslog error:", err));
 
       try {
         if (agent_id === "000") {
@@ -130,9 +133,20 @@ async function processQueueItem(item: any, ws?: WebSocket) {
           console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
         } else {
           // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
+          // Detect agent OS first
+          const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
+          const isWindows = infoOutput.toLowerCase().includes('windows');
+
           const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-          const match = arOutput.match(/Response name: (firewall-drop\d*)/);
-          const arName = match ? match[1] : 'firewall-drop';
+          
+          let arName = 'firewall-drop';
+          if (isWindows) {
+            const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
+            arName = match ? match[1] : 'netsh';
+          } else {
+            const match = arOutput.match(/Response name: (firewall-drop\d*)/);
+            arName = match ? match[1] : 'firewall-drop';
+          }
 
           await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
           console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);

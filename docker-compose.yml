@@ -13,5 +13,6 @@ services:
       - /run/systemd:/run/systemd
       - /etc/passwd:/etc/passwd:ro
       - /etc/group:/etc/group:ro
+      - /dev/log:/dev/log
     env_file:
       - .env
