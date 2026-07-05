@@ -2,6 +2,7 @@ services:
   yara:
     image: cincan/yara:latest
     container_name: yara
+    user: "0:0"
     restart: unless-stopped
     volumes:
       - /etc:/scan/etc:ro
@@ -16,7 +17,7 @@ services:
       - /var/tmp:/scan/var-tmp:ro
 
       # === YARA Rules (ซิงก์จาก Edge Connector -> Shared -> Docker) ===
-      - /var/ossec/etc/shared/default/yara_rules.yar:/opt/yara/rules/yara_rules.yar:ro
+      - /var/ossec/etc/shared/yara_rules.yar:/opt/yara/rules/yara_rules.yar:ro
 
       # === Log output ===
       - /var/yara/logs:/logs

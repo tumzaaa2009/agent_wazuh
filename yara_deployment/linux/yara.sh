@@ -35,16 +35,27 @@ ABS_FILE=$(realpath "$FILEPATH")
 
 echo "$(date -Is) yara.sh: [INFO] SCAN_START file=$ABS_FILE" >> "$LOGFILE"
 
-# ตรวจสอบว่ามีไฟล์ Rule อยู่หรือไม่
+YARA_RULES="/var/ossec/etc/shared/yara_rules.yar"
 if [ ! -f "$YARA_RULES" ]; then
-    echo "$(date -Is) yara.sh: [ERROR] YARA rules not found at $YARA_RULES" >> "$LOGFILE"
-    exit 0
+    # Fallback to default for older agents or direct manager run
+    YARA_RULES="/var/ossec/etc/shared/default/yara_rules.yar"
+    if [ ! -f "$YARA_RULES" ]; then
+        echo "$(date -Is) yara.sh: [ERROR] YARA rules not found at $YARA_RULES" >> "$LOGFILE"
+        echo "wazuh-yara: ERROR - YARA scan failed. Result: rules not found at $YARA_RULES"
+        exit 1
+    fi
 fi
+
+echo "$(date -Is) yara.sh: [INFO] SCAN_START file=$ABS_FILE. Waiting 2s for IO sync..." >> "$LOGFILE"
+
+# Fix race condition
+sleep 2
 
 echo "$(date -Is) yara.sh: [DEBUG] Executing Docker YARA container..." >> "$LOGFILE"
 
 # ============ Docker YARA Scan ============
 YARA_RESULT=$(docker run --rm \
+    -u root \
     -v "$ABS_FILE":/scan/target_file:ro \
     -v "$YARA_RULES":/opt/yara/rules/yara_rules.yar:ro \
     --entrypoint yara \
@@ -77,10 +88,17 @@ if [ -n "$CLEAN_YARA_RESULT" ] && [ $DOCKER_EXIT_CODE -eq 0 ]; then
 
     # เขียน Log แบบ parseable สำหรับ Wazuh Decoder (ส่งกลับ SOC กลาง)
     YARA_CLEAN_FORMAT=$(echo "$CLEAN_YARA_RESULT" | tr '\n' '|' | sed 's/|$//')
+    
+    # 1. Output สำหรับ YARA Alert (Rule 110900)
+    echo "wazuh-yara: INFO - Scan result: $YARA_CLEAN_FORMAT $ABS_FILE" >> "$LOGFILE"
+    
+    # 2. Output สำหรับ Quarantine Alert (Rule 110901)
     echo "QUARANTINED src=$ABS_FILE dest=DELETED sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT" >> "$LOGFILE"
 else
     if [ $DOCKER_EXIT_CODE -ne 0 ]; then
+        YARA_ERR_CLEAN=$(echo "$YARA_RESULT" | tr '\n' ' ' | sed 's/  */ /g')
         echo "$(date -Is) yara.sh: [ERROR] YARA scan failed or container error. Result: $YARA_RESULT" >> "$LOGFILE"
+        echo "wazuh-yara: ERROR - YARA scan failed. Result: $YARA_ERR_CLEAN" >> "$LOGFILE"
     else
         echo "$(date -Is) yara.sh: [INFO] CLEAN file=$FILENAME" >> "$LOGFILE"
     fi

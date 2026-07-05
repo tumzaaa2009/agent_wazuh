@@ -82,7 +82,25 @@ New-Item -ItemType Directory -Path "C:\Program Files\yara\rules" -Force
 # Copy ไฟล์ YARA
 Copy-Item yara64.exe "C:\Program Files\yara\yara64.exe"
 Copy-Item yarac64.exe "C:\Program Files\yara\yarac64.exe"
+เพิ่ม PATH 
+เปิด
+WIN+X
+ Settings > System > About >Advaced System seting >Environment Variables>System Variable>Path>C:\Program Files\YARA
+
+
+
+
+
+
+↓
+
+เพิ่ม
+
+
+
 ```
+
+
 
 ### ขั้นที่ 2: วาง Active Response Script
 
