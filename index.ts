@@ -12,7 +12,7 @@ const INDEXER_PASSWORD = process.env.INDEXER_PASSWORD || "";
 const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go.th/api/v1/yara-rules";
 
 // Master Version string
-const EDGE_VERSION = "1.0.3";
+const EDGE_VERSION = "1.0.6";
 
 import { appendFile } from "fs/promises";
 import { existsSync } from "fs";
@@ -439,6 +439,7 @@ async function syncRulePolicy() {
     const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
     const VERSION_FILE = '/var/ossec/etc/soc_rules_version.txt';
     try {
+        console.log(`📥 Querying SOC for latest policy queues...`);
         const res = await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
         if (!res.ok) return;
         const data = await res.json();
@@ -456,7 +457,9 @@ async function syncRulePolicy() {
             }
 
             if (currentTopLine !== expectedTarget) {
+                console.log(`🔍 Checking queued updates... Found patch version: ${latestUpdate.version_hash}`);
                 console.log(`[SYNC] Version mismatch detected. Local: '${currentTopLine}', Remote: '${expectedTarget}'. Updating...`);
+                console.log(`📥 Downloading configuration payload for patch: ${latestUpdate.version_hash}...`);
 
                 let configUrl = `${CENTRAL_API}/api/v1/rules/configs`;
                 if (latestUpdate.action === 'rollback') {
@@ -542,13 +545,28 @@ async function autoInjectWazuhConfigs(data: any) {
     // 1. Update Manager Config (ossec.conf) — remove old block, inject new
     if (managerMockup) {
       const START = '<!-- INJECTED BY EDGE CONNECTOR';
+      
+      // Clean up the incoming payload so it strictly starts at the INJECTED tag
+      const mockupStartIdx = managerMockup.indexOf(START);
+      if (mockupStartIdx !== -1) {
+        managerMockup = managerMockup.substring(mockupStartIdx);
+      }
+
       const END = '<!-- USER CUSTOM CONFIGURATION BLOCK ENDS HERE   -->';
       let startIdx = confContent.indexOf(START);
       let endIdx = confContent.indexOf(END);
 
       // Remove ALL existing injected blocks (if any duplicates exist due to old bugs)
       while (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-        confContent = confContent.substring(0, startIdx) + confContent.substring(endIdx + END.length);
+        // Find if there are stray "<!-- ========================================== -->" and newlines right above startIdx
+        let realStartIdx = startIdx;
+        const precedingText = confContent.substring(0, startIdx);
+        const match = precedingText.match(/(?:<!-- ========================================== -->\s*)+$/);
+        if (match) {
+          realStartIdx -= match[0].length;
+        }
+
+        confContent = confContent.substring(0, realStartIdx) + confContent.substring(endIdx + END.length);
         startIdx = confContent.indexOf(START);
         endIdx = confContent.indexOf(END);
       }
