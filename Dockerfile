@@ -2,8 +2,7 @@ FROM oven/bun:1
 
 WORKDIR /app
 
-COPY package.json index.ts ./
-
+COPY package.json index.ts version.md ./
 # Install necessary system dependencies (curl for healthcheck, iptables for firewall-drop, yara for scanning, unzip for configs)
 RUN apt-get update && apt-get install -y \
     curl \

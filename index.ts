@@ -11,6 +11,9 @@ const INDEXER_USER = process.env.INDEXER_USER || "";
 const INDEXER_PASSWORD = process.env.INDEXER_PASSWORD || "";
 const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go.th/api/v1/yara-rules";
 
+// Master Version string
+const EDGE_VERSION = "1.0.3";
+
 import { appendFile } from "fs/promises";
 import { existsSync } from "fs";
 
@@ -289,6 +292,12 @@ function connect() {
           agent_name
         }, ws);
       }
+      
+      // Handle rule policy update action
+      if (data.action === "update_policy") {
+        console.log("📥 Received update_policy trigger from Central SOC");
+        await syncRulePolicy();
+      }
 
       // 2. Handle new Array payload format (if pushed via WS)
       if (Array.isArray(data) && data[0]?.success && data[0]?.queues) {
@@ -424,6 +433,85 @@ async function fetchYaraRules() {
 }
 
 // ---------------------------------------------------------
+// SOC Rule Policy Synchronization (New Queue System)
+// ---------------------------------------------------------
+async function syncRulePolicy() {
+    const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
+    const VERSION_FILE = '/var/ossec/etc/soc_rules_version.txt';
+    try {
+        const res = await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const updates = data.queues;
+
+        if (updates && updates.length > 0) {
+            const latestUpdate = updates[0];
+            const expectedTarget = `${latestUpdate.version_hash} used`;
+
+            let currentTopLine = '';
+            if (existsSync(VERSION_FILE)) {
+                const content = await Bun.file(VERSION_FILE).text();
+                const lines = content.split('\\n').filter(l => l.trim().length > 0);
+                currentTopLine = lines.length > 0 ? lines[0].trim() : '';
+            }
+
+            if (currentTopLine !== expectedTarget) {
+                console.log(`[SYNC] Version mismatch detected. Local: '${currentTopLine}', Remote: '${expectedTarget}'. Updating...`);
+
+                let configUrl = `${CENTRAL_API}/api/v1/rules/configs`;
+                if (latestUpdate.action === 'rollback') {
+                     configUrl = `${CENTRAL_API}/api/v1/rules/backup/${latestUpdate.version_hash}`;
+                }
+                
+                const configRes = await fetch(configUrl);
+                if (configRes.ok) {
+                  const configData = await configRes.json();
+                  const { agent_xml, manager_xml, wazuh_files } = configData;
+
+                  await Bun.write('/var/ossec/etc/shared/default/agent_mockup.xml', agent_xml);
+                  await Bun.write('/var/ossec/etc/manager_mockup.xml', manager_xml);
+
+                  if (wazuh_files && Array.isArray(wazuh_files)) {
+                      for (const file of wazuh_files) {
+                          if (file.type === 'rule') {
+                              const p = `/var/ossec/etc/rules/${file.filename}`;
+                              await Bun.write(p, file.content);
+                              await $`chown root:wazuh ${p} && chmod 660 ${p}`.catch(() => {});
+                          } else if (file.type === 'decoder') {
+                              const p = `/var/ossec/etc/decoders/${file.filename}`;
+                              await Bun.write(p, file.content);
+                              await $`chown root:wazuh ${p} && chmod 660 ${p}`.catch(() => {});
+                          }
+                      }
+                  }
+
+                  // Auto inject configurations into ossec.conf and agent.conf
+                  // Note: autoInjectWazuhConfigs expects base64 encoded strings
+                  await autoInjectWazuhConfigs({
+                    mockup_agent: agent_xml ? Buffer.from(agent_xml).toString('base64') : null,
+                    mockup_manager: manager_xml ? Buffer.from(manager_xml).toString('base64') : null
+                  });
+
+                  await Bun.write(VERSION_FILE, expectedTarget + '\n');
+                  console.log(`[SYNC] Rules applied successfully for ${latestUpdate.version_hash}`);
+                  
+                  // Restart Wazuh Manager
+                  await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager`.catch(() => {});
+                }
+            } else {
+                console.log(`[SYNC] Edge is already up to date with ${expectedTarget}.`);
+            }
+
+            await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`, {
+                method: "DELETE"
+            });
+        }
+    } catch (err: any) {
+        console.error(`[SYNC ERROR]: ${err.message}`);
+    }
+}
+
+// ---------------------------------------------------------
 // SOC Wazuh Rules & Decoders Synchronization
 // ---------------------------------------------------------
 
@@ -453,14 +541,16 @@ async function autoInjectWazuhConfigs(data: any) {
 
     // 1. Update Manager Config (ossec.conf) — remove old block, inject new
     if (managerMockup) {
-      const START = '<!-- INJECTED BY EDGE CONNECTOR -->';
+      const START = '<!-- INJECTED BY EDGE CONNECTOR';
       const END = '<!-- USER CUSTOM CONFIGURATION BLOCK ENDS HERE   -->';
-      const startIdx = confContent.indexOf(START);
-      const endIdx = confContent.indexOf(END);
+      let startIdx = confContent.indexOf(START);
+      let endIdx = confContent.indexOf(END);
 
-      // Remove existing injected block (if any)
-      if (startIdx !== -1 && endIdx !== -1) {
+      // Remove ALL existing injected blocks (if any duplicates exist due to old bugs)
+      while (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
         confContent = confContent.substring(0, startIdx) + confContent.substring(endIdx + END.length);
+        startIdx = confContent.indexOf(START);
+        endIdx = confContent.indexOf(END);
       }
 
       // Inject new block right before </ossec_config>
@@ -562,6 +652,36 @@ async function deployYaraWpk() {
   return;
 }
 
+// ---------------------------------------------------------
+// Self-Updater Mechanism
+// ---------------------------------------------------------
+async function checkSelfUpdate() {
+  if (process.env.IS_MASTER === "true") {
+    // Master node does not self-update; it serves the update
+    return;
+  }
+  const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
+  try {
+    const res = await fetch(`${CENTRAL_API}/api/v1/edge-connector/version`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && data.version && data.version !== EDGE_VERSION) {
+        console.log(`🚀 [UPDATE] New version detected! Remote: ${data.version}, Local: ${EDGE_VERSION}`);
+        console.log(`📥 Downloading new index.ts...`);
+        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/edge-connector/script`);
+        if (scriptRes.ok) {
+          const scriptText = await scriptRes.text();
+          await Bun.write('/app/index.ts', scriptText);
+          console.log(`✅ [UPDATE] Successfully overwrote local script. Exiting so container automatically restarts...`);
+          process.exit(0);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ Failed to check for self-updates:", err);
+  }
+}
+
 
 // Start WebSocket connection
 connect();
@@ -601,11 +721,53 @@ setInterval(fetchYaraRules, 24 * 60 * 60 * 1000);
 fetchSocConfigs();
 setInterval(fetchSocConfigs, 24 * 60 * 60 * 1000);
 
+// Run Rule Policy Sync periodically (every 1 min)
+syncRulePolicy();
+setInterval(syncRulePolicy, 60000);
+
 // Run WPK Deployment Orchestrator periodically (every 5 mins)
 deployYaraWpk();
 setInterval(deployYaraWpk, 5 * 60 * 1000);
 
+// Run Self-Updater periodically (every 5 mins)
+checkSelfUpdate();
+setInterval(checkSelfUpdate, 5 * 60 * 1000);
+
 // Uncomment to enable HTTP API Polling every 10 seconds
 setInterval(pollApiQueue, 10000);
 
-
+// ---------------------------------------------------------
+// Master Server API (Only runs if IS_MASTER=true)
+// ---------------------------------------------------------
+if (process.env.IS_MASTER === "true") {
+  console.log("👑 Starting Master API Server on port 5050...");
+  Bun.serve({
+    port: 5050,
+    async fetch(req) {
+      const url = new URL(req.url);
+      
+      if (url.pathname === "/api/v1/edge-connector/version") {
+        try {
+          // Master node reads version.md which is updated by update_version.sh
+          const version = await Bun.file('/app/version.md').text();
+          return Response.json({ success: true, version: version.trim() });
+        } catch (err) {
+          return Response.json({ success: false, error: "version.md not found" }, { status: 404 });
+        }
+      }
+      
+      if (url.pathname === "/api/v1/edge-connector/script") {
+        try {
+          const script = await Bun.file('/app/index.ts').text();
+          return new Response(script, {
+            headers: { "Content-Type": "text/plain" }
+          });
+        } catch (err) {
+          return Response.json({ success: false, error: "index.ts not found" }, { status: 404 });
+        }
+      }
+      
+      return Response.json({ success: false, error: "Not Found" }, { status: 404 });
+    }
+  });
+}
