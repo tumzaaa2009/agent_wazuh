@@ -10,8 +10,8 @@ NEW_VERSION=$1
 
 echo "Updating version to $NEW_VERSION..."
 
-# Update version.md
-echo "$NEW_VERSION" > version.md
+# Update version.txt
+echo "$NEW_VERSION" > version.txt
 
 # Update index.ts
 sed -i "s/const EDGE_VERSION = \".*\";/const EDGE_VERSION = \"$NEW_VERSION\";/" index.ts

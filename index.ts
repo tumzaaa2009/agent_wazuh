@@ -1,5 +1,5 @@
 import { $ } from "bun";
-
+//aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa////
 const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "";
@@ -11,9 +11,7 @@ const INDEXER_USER = process.env.INDEXER_USER || "";
 const INDEXER_PASSWORD = process.env.INDEXER_PASSWORD || "";
 const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go.th/api/v1/yara-rules";
 
-// Master Version string
-const EDGE_VERSION = "1.0.6";
-
+// Master Version is maintained in agent_version.txt
 import { appendFile } from "fs/promises";
 import { existsSync } from "fs";
 
@@ -297,6 +295,12 @@ function connect() {
       if (data.action === "update_policy") {
         console.log("📥 Received update_policy trigger from Central SOC");
         await syncRulePolicy();
+      }
+
+      // Handle agent patch update action
+      if (data.action === "update_agent") {
+        console.log("📥 Received update_agent trigger from Central SOC");
+        await checkSelfUpdate();
       }
 
       // 2. Handle new Array payload format (if pushed via WS)
@@ -674,23 +678,30 @@ async function deployYaraWpk() {
 // Self-Updater Mechanism
 // ---------------------------------------------------------
 async function checkSelfUpdate() {
-  if (process.env.IS_MASTER === "true") {
-    // Master node does not self-update; it serves the update
-    return;
-  }
   const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
   try {
+    console.log(`📥 Querying edge index.ts for latest agent patches...`);
     const res = await fetch(`${CENTRAL_API}/api/v1/edge-connector/version`);
     if (res.ok) {
       const data = await res.json();
-      if (data.success && data.version && data.version !== EDGE_VERSION) {
-        console.log(`🚀 [UPDATE] New version detected! Remote: ${data.version}, Local: ${EDGE_VERSION}`);
+      const currentDir = import.meta.dir;
+      const versionFile = `${currentDir}/agent_version.txt`;
+      
+      let localVersion = "";
+      if (existsSync(versionFile)) {
+        const content = await Bun.file(versionFile).text();
+        localVersion = content.trim();
+      }
+      
+      if (data.success && data.version && data.version !== localVersion) {
+        console.log(`🚀 [UPDATE] New version detected! Remote: ${data.version}, Local: ${localVersion}`);
         console.log(`📥 Downloading new index.ts...`);
         const scriptRes = await fetch(`${CENTRAL_API}/api/v1/edge-connector/script`);
         if (scriptRes.ok) {
           const scriptText = await scriptRes.text();
-          await Bun.write('/app/index.ts', scriptText);
-          console.log(`✅ [UPDATE] Successfully overwrote local script. Exiting so container automatically restarts...`);
+          await Bun.write(`${currentDir}/index.ts`, scriptText);
+          await Bun.write(versionFile, data.version);
+          console.log(`✅ [UPDATE] Successfully overwrote local script and agent_version.txt. Exiting so container automatically restarts...`);
           process.exit(0);
         }
       }
@@ -766,11 +777,13 @@ if (process.env.IS_MASTER === "true") {
       
       if (url.pathname === "/api/v1/edge-connector/version") {
         try {
-          // Master node reads version.md which is updated by update_version.sh
-          const version = await Bun.file('/app/version.md').text();
-          return Response.json({ success: true, version: version.trim() });
+          const versionContent = await Bun.file(`${import.meta.dir}/agent_version.txt`).text();
+          const lines = versionContent.split('\n').filter(l => l.trim().length > 0);
+          const usedLine = lines.find(l => l.endsWith(' used')) || lines[0] || '';
+          const currentHash = usedLine.replace(' used', '').trim();
+          return Response.json({ success: true, version: currentHash });
         } catch (err) {
-          return Response.json({ success: false, error: "version.md not found" }, { status: 404 });
+          return Response.json({ success: false, error: "agent_version.txt not found" }, { status: 404 });
         }
       }
       
