@@ -1,5 +1,5 @@
 import { $ } from "bun";
-//aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa////
+//sssssssssss////
 const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "";
