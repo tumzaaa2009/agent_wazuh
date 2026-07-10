@@ -11,6 +11,9 @@ services:
       - ./logs:/app/logs
       - ./index.ts:/app/index.ts
       - ./agent_version.txt:/app/agent_version.txt
+      - ./version_custom_soc.txt:/app/version_custom_soc.txt
+      - ./soc_rules_version.txt:/app/soc_rules_version.txt
+      - ./custom-soc:/app/custom-soc
       - /run/dbus:/run/dbus
       - /run/systemd:/run/systemd
       - /etc/passwd:/etc/passwd:ro

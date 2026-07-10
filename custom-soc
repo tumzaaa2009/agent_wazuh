@@ -10,7 +10,7 @@ import os
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =========================================================================
-# 1. READ DYNAMIC VARIABLES FROM .ENV (เพื่อให้สคริปต์นี้ใช้ได้กับทุกโรงพยาบาล)
+# 2. test คับ tummmmmmmmmmmmmmmmmm
 # =========================================================================
 env_file = "/var/hos-edge-connector/.env"
 env_vars = {}

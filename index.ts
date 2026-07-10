@@ -1,5 +1,30 @@
-import { $ } from "bun";
-//sssssssssss////
+import { $, serve } from "bun";
+import * as os from "os";
+import { exec } from "child_process";
+import { existsSync } from "fs";
+
+//patch update new custom-soc v3 tuummmmmmmmmmmmmm////
+
+// --- 0. Set System Timezone (Asia/Bangkok) ---
+function setSystemTimezone() {
+  process.env.TZ = "Asia/Bangkok";
+  const platform = os.platform();
+  
+  if (platform === 'win32') {
+    exec('tzutil /s "SE Asia Standard Time"', (err) => {
+      if (err) console.log("⚠️ Failed to set Windows timezone (Run as Admin required):", err.message);
+      else console.log("✅ Successfully set Windows timezone to SE Asia Standard Time");
+    });
+  } else if (platform === 'linux') {
+    // Try timedatectl first, fallback to symlink for Docker containers
+    exec('timedatectl set-timezone Asia/Bangkok || ln -sf /usr/share/zoneinfo/Asia/Bangkok /etc/localtime', (err) => {
+      if (err) console.log("⚠️ Failed to set Linux timezone:", err.message);
+      else console.log("✅ Successfully set Linux timezone to Asia/Bangkok");
+    });
+  }
+}
+setSystemTimezone();
+
 const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "";
@@ -259,6 +284,9 @@ function connect() {
   ws.onopen = () => {
     console.log("✅ Connected to Central SOC WebSocket!");
 
+    // Trigger self-update check instantly upon connection/reconnection
+    checkSelfUpdate();
+
     const registerMsg = {
       type: "register",
       hospital_code: HOSPITAL_CODE,
@@ -328,56 +356,7 @@ function connect() {
   };
 }
 
-// ---------------------------------------------------------
-// Real-time Alert Forwarding (Tail Push)
-// ---------------------------------------------------------
-function startAlertTailing() {
-  const alertsFile = '/var/ossec/logs/alerts/alerts.json';
-  if (!existsSync(alertsFile)) {
-    console.log(`⚠️ ${alertsFile} not found. Retrying in 10s...`);
-    setTimeout(startAlertTailing, 10000);
-    return;
-  }
-  
-  console.log(`📡 Starting real-time tail of ${alertsFile}...`);
-  const { spawn } = require('child_process');
-  const tail = spawn('tail', ['-F', '-n', '0', alertsFile]);
-  const API_BASE = process.env.API_URL || "https://rh4cloudcenter.moph.go.th/api/v1";
-  
-  let buffer = '';
-  tail.stdout.on('data', (data: any) => {
-    buffer += data.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // Keep the last partial line in buffer
-    
-    for (const line of lines) {
-      if (line.trim() === '') continue;
-      try {
-        const alert = JSON.parse(line);
-        // Fire-and-forget fetch to SOC
-        fetch(`${API_BASE}/alerts`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${API_KEY}`
-          },
-          body: JSON.stringify(alert)
-        }).catch(err => {});
-      } catch (e) {
-        // ignore parse error
-      }
-    }
-  });
-  
-  tail.on('error', (err: any) => {
-    console.error("❌ Tail process error:", err);
-  });
-  
-  tail.on('close', () => {
-    console.log("⚠️ Tail process closed. Restarting in 5s...");
-    setTimeout(startAlertTailing, 5000);
-  });
-}
+
 
 // ---------------------------------------------------------
 // HTTP Polling Flow (Pull-based API) - Optional
@@ -492,7 +471,7 @@ async function fetchYaraRules() {
 // ---------------------------------------------------------
 async function syncRulePolicy() {
   const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
-  const VERSION_FILE = '/var/ossec/etc/soc_rules_version.txt';
+  const VERSION_FILE = `${import.meta.dir}/soc_rules_version.txt`;
   try {
     console.log(`📥 Querying SOC for latest policy queues...`);
     const res = await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
@@ -657,7 +636,8 @@ async function fetchSocConfigs() {
     if (versionRes.ok) {
       const vData = await versionRes.json();
       if (vData.success && vData.version) {
-        const versionFile = '/var/ossec/etc/soc_rules_version.txt';
+        const currentDir = import.meta.dir;
+        const versionFile = `${currentDir}/soc_rules_version.txt`;
         const fileExists = await Bun.file(versionFile).exists();
         if (fileExists) {
           const localVersion = (await Bun.file(versionFile).text()).trim();
@@ -680,7 +660,10 @@ async function fetchSocConfigs() {
                 const filepath = `/var/ossec/etc/rules/${rule.filename}`;
                 const decodedContent = Buffer.from(rule.content, 'base64').toString('utf-8');
                 await Bun.write(filepath, decodedContent);
-                await $`chown root:wazuh ${filepath} && chmod 750 ${filepath}`;
+                await $`chmod 640 ${filepath}`.catch(() => {});
+                await $`chown root:wazuh ${filepath}`.catch((e) => {
+                  console.log(`⚠️ Note: Could not set root:wazuh on ${filepath}`);
+                });
               }
             }
 
@@ -695,8 +678,9 @@ async function fetchSocConfigs() {
             }
 
             // Save the new version
-            await Bun.write('/var/ossec/etc/soc_rules_version.txt', vData.version);
-            await $`chown root:wazuh /var/ossec/etc/soc_rules_version.txt && chmod 640 /var/ossec/etc/soc_rules_version.txt`;
+            await Bun.write(versionFile, vData.version);
+            // Permissions for version file might not be strictly needed since it's in our dir, but just in case
+            await $`chmod 640 ${versionFile}`.catch(() => {});
 
             // Auto inject configurations
             await autoInjectWazuhConfigs(data);
@@ -753,12 +737,65 @@ async function checkSelfUpdate() {
           await Bun.write(`${currentDir}/index.ts`, scriptText);
           await Bun.write(versionFile, data.version);
           console.log(`✅ [UPDATE] Successfully overwrote local script and agent_version.txt. Exiting so container automatically restarts...`);
-          process.exit(0);
+          process.exit(1);
         }
       }
     }
   } catch (err) {
     console.error("❌ Failed to check for self-updates:", err);
+  }
+}
+
+// ---------------------------------------------------------
+// Custom SOC Updater Mechanism
+// ---------------------------------------------------------
+async function checkCustomSocUpdate() {
+  const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
+  try {
+    console.log(`📥 Querying API for latest Custom SOC patches...`);
+    const res = await fetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
+    if (res.ok) {
+      const data = await res.json();
+      const currentDir = import.meta.dir;
+      const versionFile = `${currentDir}/version_custom_soc.txt`;
+      const scriptFile = `${currentDir}/custom-soc`;
+
+      let localVersion = "";
+      if (existsSync(versionFile)) {
+        const content = await Bun.file(versionFile).text();
+        localVersion = content.trim();
+      } else {
+        // Create file if it doesn't exist
+        await Bun.write(versionFile, "");
+      }
+
+      const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
+      if ((data.success && data.version && data.version !== localVersion) || !existsSync(wazuhIntegrationPath)) {
+        console.log(`🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}. Missing in Wazuh: ${!existsSync(wazuhIntegrationPath)}`);
+        console.log(`📥 Downloading new custom-soc script...`);
+        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
+        if (scriptRes.ok) {
+          const scriptText = await scriptRes.text();
+          
+          // Save locally
+          await Bun.write(scriptFile, scriptText);
+          await Bun.write(versionFile, data.version);
+          await $`chmod +x ${scriptFile}`.catch(() => {});
+          
+          // Deploy directly to Wazuh Integrations path
+          const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
+          await Bun.write(wazuhIntegrationPath, scriptText);
+          await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => {});
+          await $`chown root:wazuh ${wazuhIntegrationPath}`.catch((e) => {
+             console.log(`⚠️ Note: Could not set root:wazuh ownership on ${wazuhIntegrationPath} (maybe group missing).`);
+          });
+
+          console.log(`✅ [UPDATE] Successfully overwrote local custom-soc and deployed to ${wazuhIntegrationPath}.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ Failed to check for Custom SOC updates:", err);
   }
 }
 
@@ -813,11 +850,14 @@ setInterval(deployYaraWpk, 5 * 60 * 1000);
 checkSelfUpdate();
 setInterval(checkSelfUpdate, 5 * 60 * 1000);
 
+// Run Custom SOC Updater periodically (every 5 mins)
+checkCustomSocUpdate();
+setInterval(checkCustomSocUpdate, 5 * 60 * 1000);
+
 // Uncomment to enable HTTP API Polling every 10 seconds
 setInterval(pollApiQueue, 10000);
 
-// Start Real-time Alert Tailing
-startAlertTailing();
+
 
 // ---------------------------------------------------------
 // Master Server API (Only runs if IS_MASTER=true)
