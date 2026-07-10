@@ -4,38 +4,14 @@ import json
 import re
 import requests
 import urllib3
-import os
 
 # Suppress SSL warnings (self-signed cert environment)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# =========================================================================
-# 1. READ DYNAMIC VARIABLES FROM .ENV (เพื่อให้สคริปต์นี้ใช้ได้กับทุกโรงพยาบาล)
-# =========================================================================
-env_file = "/var/hos-edge-connector/.env"
-env_vars = {}
-try:
-    with open(env_file, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"): continue
-            match = re.match(r'^([^=]+)=(.*)$', line)
-            if match:
-                key = match.group(1).strip()
-                val = match.group(2).strip().split('#')[0].strip()
-                if val.startswith('"') and val.endswith('"'): val = val[1:-1]
-                elif val.startswith("'") and val.endswith("'"): val = val[1:-1]
-                env_vars[key] = val
-except Exception:
-    pass
-
 API_URL = "https://rh4cloudcenter.moph.go.th/api/v1/alerts"
 MALWARE_API_URL = "https://rh4cloudcenter.moph.go.th/api/v1/malware-events"
-
-# ดึงค่าจาก .env ถ้าไม่มีให้ใช้ค่า Default (ป้องกัน Error)
-API_KEY = env_vars.get("API_KEY", "KEY_UNKNOWN")
-HOSPITAL_CODE = env_vars.get("HOSPITAL_CODE", "00000")
-HOSPITAL_NAME = env_vars.get("HOSPITAL_NAME", "Unknown Hospital")
+API_KEY = "KEY_141"
+HOSPITAL_CODE = "141"
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -55,7 +31,6 @@ def report_malware_event(alert: dict, full_log: str):
 
     malware_payload = {
         "hospital_code": HOSPITAL_CODE,
-        "hospital_name": HOSPITAL_NAME,
         "hash_sha256": sha256_match.group(1) if sha256_match else "",
         "hash_md5":    md5_match.group(1)    if md5_match    else "",
         "filename":    filename,
@@ -85,15 +60,18 @@ def main():
     with open("/var/ossec/logs/integrations.log", "a") as log:
         log.write(f"custom-soc triggered with args: {sys.argv}\n")
 
-    # Read alert file passed by Wazuh (sys.argv[1] is the alert file path)
     if len(sys.argv) < 2:
-        sys.exit(1)
+        return
 
     alert_file = sys.argv[1]
-    with open(alert_file, "r") as f:
-        alert = json.load(f)
+    try:
+        with open(alert_file, "r") as f:
+            alert = json.load(f)
+    except Exception as e:
+        with open("/var/ossec/logs/integrations.log", "a") as log:
+            log.write(f"Error loading JSON: {e}\n")
+        return
 
-    # Some integrations wrap alert inside "_source", unwrap if needed
     if "_source" in alert:
         alert = alert["_source"]
 
@@ -101,20 +79,17 @@ def main():
     rule_desc  = alert.get("rule", {}).get("description", "")
     full_log   = alert.get("full_log", "")
 
-    # --- 2. YARA Malware Event Hook ---
+    # --- YARA Malware Event Hook ---
+    # Detect QUARANTINED events (from yara.sh / yara.bat active response)
     if "QUARANTINED" in full_log or "yara" in rule_desc.lower():
         with open("/var/ossec/logs/integrations.log", "a") as log:
             log.write(f"[malware-event] YARA/QUARANTINED event detected. Reporting to SOC...\n")
         report_malware_event(alert, full_log)
 
-    # --- 3. Standard Alert Forwarding (Level > 5) ---
-    if int(rule_level) >= 3:
+    # --- Standard Alert Forwarding (Level > 5) ---
+    if int(rule_level) > 5:
         payload = alert.copy()
-        
-        # แนบข้อมูลประจำโรงพยาบาลเข้าไปด้วย เพื่อให้ส่วนกลางเห็นใน Discover
         payload["hospital_code"] = HOSPITAL_CODE
-        payload["hospital_name"] = HOSPITAL_NAME
-        
         try:
             r = requests.post(
                 API_URL,
