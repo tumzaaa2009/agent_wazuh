@@ -9,7 +9,7 @@ import { existsSync } from "fs";
 function setSystemTimezone() {
   process.env.TZ = "Asia/Bangkok";
   const platform = os.platform();
-
+  
   if (platform === 'win32') {
     exec('tzutil /s "SE Asia Standard Time"', (err) => {
       if (err) console.log("⚠️ Failed to set Windows timezone (Run as Admin required):", err.message);
@@ -683,7 +683,7 @@ async function fetchSocConfigs() {
                 const filepath = `/var/ossec/etc/rules/${rule.filename}`;
                 const decodedContent = Buffer.from(rule.content, 'base64').toString('utf-8');
                 await Bun.write(filepath, decodedContent);
-                await $`chmod 640 ${filepath}`.catch(() => { });
+                await $`chmod 640 ${filepath}`.catch(() => {});
                 await $`chown root:wazuh ${filepath}`.catch((e) => {
                   console.log(`⚠️ Note: Could not set root:wazuh on ${filepath}`);
                 });
@@ -704,7 +704,7 @@ async function fetchSocConfigs() {
             const remoteVersion = String(vData.version).split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
             await Bun.write(versionFile, remoteVersion + " used\n");
             // Permissions for version file might not be strictly needed since it's in our dir, but just in case
-            await $`chmod 640 ${versionFile}`.catch(() => { });
+            await $`chmod 640 ${versionFile}`.catch(() => {});
 
             // Auto inject configurations
             await autoInjectWazuhConfigs(data);
@@ -775,43 +775,52 @@ async function checkSelfUpdate() {
 // ---------------------------------------------------------
 async function checkCustomSocUpdate() {
   const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
+  const currentDir = import.meta.dir;
+  const versionFile = `${currentDir}/version_custom_soc.txt`;
+  const scriptFile = `${currentDir}/custom-soc`;
+  const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
+
   try {
+    let localVersion = "";
+    if (existsSync(versionFile)) {
+      localVersion = (await Bun.file(versionFile).text()).trim();
+    } else {
+      await Bun.write(versionFile, "");
+    }
+
+    // 1. Ensure local script is copied to Wazuh if it's missing in Wazuh but exists locally
+    if (!existsSync(wazuhIntegrationPath) && existsSync(scriptFile)) {
+      console.log(`📥 Restoring missing custom-soc to Wazuh from local backup...`);
+      const scriptText = await Bun.file(scriptFile).text();
+      await Bun.write(wazuhIntegrationPath, scriptText);
+      await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => {});
+      await $`chown root:wazuh ${wazuhIntegrationPath}`.catch(() => {});
+      console.log(`✅ Successfully restored custom-soc to ${wazuhIntegrationPath}.`);
+    }
+
+    // 2. Check for updates from Central API
     console.log(`📥 Querying API for latest Custom SOC patches...`);
     const res = await fetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
     if (res.ok) {
       const data = await res.json();
-      const currentDir = import.meta.dir;
-      const versionFile = `${currentDir}/version_custom_soc.txt`;
-      const scriptFile = `${currentDir}/custom-soc`;
-
-      let localVersion = "";
-      if (existsSync(versionFile)) {
-        const content = await Bun.file(versionFile).text();
-        localVersion = content.trim();
-      } else {
-        // Create file if it doesn't exist
-        await Bun.write(versionFile, "");
-      }
-
-      const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
-      if ((data.success && data.version && data.version !== localVersion) || !existsSync(wazuhIntegrationPath)) {
-        console.log(`🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}. Missing in Wazuh: ${!existsSync(wazuhIntegrationPath)}`);
+      
+      if (data.success && data.version && data.version !== localVersion) {
+        console.log(`🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}.`);
         console.log(`📥 Downloading new custom-soc script...`);
         const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
         if (scriptRes.ok) {
           const scriptText = await scriptRes.text();
-
+          
           // Save locally
           await Bun.write(scriptFile, scriptText);
           await Bun.write(versionFile, data.version);
-          await $`chmod +x ${scriptFile}`.catch(() => { });
-
-          // Deploy directly to Wazuh Integrations path
-          const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
+          await $`chmod +x ${scriptFile}`.catch(() => {});
+          
+          // Deploy to Wazuh
           await Bun.write(wazuhIntegrationPath, scriptText);
-          await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => { });
+          await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => {});
           await $`chown root:wazuh ${wazuhIntegrationPath}`.catch((e) => {
-            console.log(`⚠️ Note: Could not set root:wazuh ownership on ${wazuhIntegrationPath} (maybe group missing).`);
+             console.log(`⚠️ Note: Could not set root:wazuh ownership on ${wazuhIntegrationPath}`);
           });
 
           console.log(`✅ [UPDATE] Successfully overwrote local custom-soc and deployed to ${wazuhIntegrationPath}.`);
@@ -845,7 +854,7 @@ async function checkMispUpdates() {
         console.log(`📥 MISP IOC updates found (${data.version})!`);
         await downloadMispCdb();
         await Bun.write(versionFile, data.version);
-
+        
         console.log("🔄 Restarting wazuh-manager to apply new MISP DB...");
         exec("systemctl restart wazuh-manager.service", (err) => {
           if (err) console.error("❌ Failed to restart wazuh-manager:", err.message);
