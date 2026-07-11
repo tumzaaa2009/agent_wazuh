@@ -10,7 +10,7 @@ import os
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =========================================================================
-# 2. test คับ tummmmmmmmmmmmmmmmmm
+# 2. test คับ Hello!!!!
 # =========================================================================
 env_file = "/var/hos-edge-connector/.env"
 env_vars = {}

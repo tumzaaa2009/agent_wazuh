@@ -3,13 +3,13 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update new custom-soc v3 tuummmmmmmmmmmmmm////
+//patch update ข้อมูล cdb list แยก hash ip domain fixbug v6 ////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
   process.env.TZ = "Asia/Bangkok";
   const platform = os.platform();
-  
+
   if (platform === 'win32') {
     exec('tzutil /s "SE Asia Standard Time"', (err) => {
       if (err) console.log("⚠️ Failed to set Windows timezone (Run as Admin required):", err.message);
@@ -25,6 +25,20 @@ function setSystemTimezone() {
 }
 setSystemTimezone();
 
+// --- 0.1 Fix Missing Legacy CDB Lists (Prevents API 500 Error) ---
+function setupDummyLists() {
+  const platform = os.platform();
+  if (platform === 'linux') {
+    // Wazuh dashboard API crashes with 500 if these files are missing
+    // Files MUST have at least one valid key:value pair, otherwise wazuh-analysisd fails to load them
+    exec('mkdir -p /var/ossec/etc/lists/malicious-ioc && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-ip && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-domains && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malware-hashes && chown -R wazuh:wazuh /var/ossec/etc/lists/malicious-ioc', (err) => {
+      if (err) console.log("⚠️ Failed to setup dummy lists:", err.message);
+      else console.log("✅ Successfully verified legacy lists exist.");
+    });
+  }
+}
+setupDummyLists();
+
 const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "";
@@ -32,6 +46,7 @@ const PROVINCE = process.env.PROVINCE || "";
 const ZONE = process.env.ZONE || "";
 const API_KEY = process.env.API_KEY || "";
 const INDEXER_URL = process.env.INDEXER_URL || "";
+const BASE_API_URL = WS_URL.replace("wss://", "https://").replace("/ws/active-response", "");
 const INDEXER_USER = process.env.INDEXER_USER || "";
 const INDEXER_PASSWORD = process.env.INDEXER_PASSWORD || "";
 const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go.th/api/v1/yara-rules";
@@ -323,6 +338,12 @@ function connect() {
       if (data.action === "update_policy") {
         console.log("📥 Received update_policy trigger from Central SOC");
         await syncRulePolicy();
+      }
+
+      // Handle threat intel sync
+      if (data.action === "SYNC_THREAT_INTEL") {
+        console.log("📥 Received SYNC_THREAT_INTEL trigger from Central SOC");
+        await downloadMispCdb();
       }
 
       // Handle agent patch update action
@@ -660,7 +681,7 @@ async function fetchSocConfigs() {
                 const filepath = `/var/ossec/etc/rules/${rule.filename}`;
                 const decodedContent = Buffer.from(rule.content, 'base64').toString('utf-8');
                 await Bun.write(filepath, decodedContent);
-                await $`chmod 640 ${filepath}`.catch(() => {});
+                await $`chmod 640 ${filepath}`.catch(() => { });
                 await $`chown root:wazuh ${filepath}`.catch((e) => {
                   console.log(`⚠️ Note: Could not set root:wazuh on ${filepath}`);
                 });
@@ -680,7 +701,7 @@ async function fetchSocConfigs() {
             // Save the new version
             await Bun.write(versionFile, vData.version);
             // Permissions for version file might not be strictly needed since it's in our dir, but just in case
-            await $`chmod 640 ${versionFile}`.catch(() => {});
+            await $`chmod 640 ${versionFile}`.catch(() => { });
 
             // Auto inject configurations
             await autoInjectWazuhConfigs(data);
@@ -776,18 +797,18 @@ async function checkCustomSocUpdate() {
         const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
         if (scriptRes.ok) {
           const scriptText = await scriptRes.text();
-          
+
           // Save locally
           await Bun.write(scriptFile, scriptText);
           await Bun.write(versionFile, data.version);
-          await $`chmod +x ${scriptFile}`.catch(() => {});
-          
+          await $`chmod +x ${scriptFile}`.catch(() => { });
+
           // Deploy directly to Wazuh Integrations path
           const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
           await Bun.write(wazuhIntegrationPath, scriptText);
-          await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => {});
+          await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => { });
           await $`chown root:wazuh ${wazuhIntegrationPath}`.catch((e) => {
-             console.log(`⚠️ Note: Could not set root:wazuh ownership on ${wazuhIntegrationPath} (maybe group missing).`);
+            console.log(`⚠️ Note: Could not set root:wazuh ownership on ${wazuhIntegrationPath} (maybe group missing).`);
           });
 
           console.log(`✅ [UPDATE] Successfully overwrote local custom-soc and deployed to ${wazuhIntegrationPath}.`);
@@ -799,6 +820,79 @@ async function checkCustomSocUpdate() {
   }
 }
 
+async function checkMispUpdates() {
+  try {
+    console.log(`📥 Checking for MISP updates at /api/v1/threat-intel/misp-version...`);
+    const res = await fetch(`${BASE_API_URL}/api/v1/threat-intel/misp-version`, {
+      headers: { "Authorization": `Bearer ${API_KEY}` }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && data.version) {
+        const versionFile = `/var/ossec/etc/lists/version_misp_ioc.txt`;
+        const fileExists = await Bun.file(versionFile).exists();
+        if (fileExists) {
+          const localVersion = (await Bun.file(versionFile).text()).trim();
+          if (localVersion === data.version) {
+            return;
+          }
+        }
+
+        console.log(`📥 MISP IOC updates found (${data.version})!`);
+        await downloadMispCdb();
+        await Bun.write(versionFile, data.version);
+
+        console.log("🔄 Restarting wazuh-manager to apply new MISP DB...");
+        exec("systemctl restart wazuh-manager.service", (err) => {
+          if (err) console.error("❌ Failed to restart wazuh-manager:", err.message);
+          else console.log("✅ Successfully restarted wazuh-manager.");
+        });
+      }
+    }
+  } catch (err) {
+    console.error("❌ Failed to check for MISP updates:", err);
+  }
+}
+
+async function downloadMispCdb() {
+  console.log("📥 Downloading MISP CDB lists from Central SOC...");
+  try {
+    const listDir = "/var/ossec/etc/lists";
+    if (!existsSync(listDir)) {
+      exec(`mkdir -p ${listDir}`);
+    }
+
+    const types = [
+      { url: 'misp-ip.txt', file: 'misp_ip' },
+      { url: 'misp-domain.txt', file: 'misp_domain' },
+      { url: 'misp-hash.txt', file: 'misp_hash' }
+    ];
+
+    let downloadedCount = 0;
+
+    for (const { url, file } of types) {
+      const res = await fetch(`${BASE_API_URL}/api/v1/threat-intel/${url}`, {
+        headers: { "Authorization": `Bearer ${API_KEY}` }
+      });
+      if (res.ok) {
+        const text = await res.text();
+        await Bun.write(`/var/ossec/etc/lists/${file}`, text);
+        console.log(`✅ Saved ${file} to /var/ossec/etc/lists/`);
+        downloadedCount++;
+      } else if (res.status === 404) {
+        console.log(`ℹ️ No MISP CDB list found for ${file} on Central SOC yet.`);
+      } else {
+        console.error(`❌ Failed to download ${file}. Status: ${res.status}`);
+      }
+    }
+
+    if (downloadedCount > 0) {
+      console.log("✅ Successfully downloaded MISP CDB lists. Awaiting wazuh restart to apply.");
+    }
+  } catch (e: any) {
+    console.error("❌ Error downloading MISP CDBs:", e.message);
+  }
+}
 
 // Start WebSocket connection
 connect();
@@ -853,6 +947,10 @@ setInterval(checkSelfUpdate, 5 * 60 * 1000);
 // Run Custom SOC Updater periodically (every 5 mins)
 checkCustomSocUpdate();
 setInterval(checkCustomSocUpdate, 5 * 60 * 1000);
+
+// Run MISP updates periodically (every 1 min)
+checkMispUpdates();
+setInterval(checkMispUpdates, 60000);
 
 // Uncomment to enable HTTP API Polling every 10 seconds
 setInterval(pollApiQueue, 10000);
