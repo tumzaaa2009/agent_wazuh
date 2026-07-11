@@ -13,6 +13,7 @@ services:
       - ./agent_version.txt:/app/agent_version.txt
       - ./version_custom_soc.txt:/app/version_custom_soc.txt
       - ./soc_rules_version.txt:/app/soc_rules_version.txt
+      - ./version_misp_ioc.txt:/app/version_misp_ioc.txt
       - ./custom-soc:/app/custom-soc
       - /run/dbus:/run/dbus
       - /run/systemd:/run/systemd

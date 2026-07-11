@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update ข้อมูล cdb list แยก hash ip domain fixbug v6 ////
+//patch update ข้อมูล cdb list แยก hash ip domain fixbug v7 ////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -507,7 +507,7 @@ async function syncRulePolicy() {
       let currentTopLine = '';
       if (existsSync(VERSION_FILE)) {
         const content = await Bun.file(VERSION_FILE).text();
-        const lines = content.split('\\n').filter(l => l.trim().length > 0);
+        const lines = content.split('\n').filter(l => l.trim().length > 0);
         currentTopLine = lines.length > 0 ? lines[0].trim() : '';
       }
 
@@ -661,8 +661,10 @@ async function fetchSocConfigs() {
         const versionFile = `${currentDir}/soc_rules_version.txt`;
         const fileExists = await Bun.file(versionFile).exists();
         if (fileExists) {
-          const localVersion = (await Bun.file(versionFile).text()).trim();
-          if (localVersion === vData.version) {
+          const content = await Bun.file(versionFile).text();
+          const localVersion = content.split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
+          const remoteVersion = String(vData.version).split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
+          if (localVersion === remoteVersion || localVersion === `${remoteVersion} used`) {
             console.log("✅ SOC Configs are already up to date. Skipping download.");
             return;
           }
@@ -699,7 +701,8 @@ async function fetchSocConfigs() {
             }
 
             // Save the new version
-            await Bun.write(versionFile, vData.version);
+            const remoteVersion = String(vData.version).split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
+            await Bun.write(versionFile, remoteVersion + " used\n");
             // Permissions for version file might not be strictly needed since it's in our dir, but just in case
             await $`chmod 640 ${versionFile}`.catch(() => { });
 
@@ -829,7 +832,8 @@ async function checkMispUpdates() {
     if (res.ok) {
       const data = await res.json();
       if (data.success && data.version) {
-        const versionFile = `/var/ossec/etc/lists/version_misp_ioc.txt`;
+        const currentDir = import.meta.dir;
+        const versionFile = `${currentDir}/version_misp_ioc.txt`;
         const fileExists = await Bun.file(versionFile).exists();
         if (fileExists) {
           const localVersion = (await Bun.file(versionFile).text()).trim();
