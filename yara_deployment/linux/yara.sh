@@ -86,14 +86,15 @@ if [ -n "$CLEAN_YARA_RESULT" ] && [ $DOCKER_EXIT_CODE -eq 0 ]; then
         echo "$(date -Is) yara.sh: [ERROR] Failed to delete file." >> "$LOGFILE"
     fi
 
-    # เขียน Log แบบ parseable สำหรับ Wazuh Decoder (ส่งกลับ SOC กลาง)
-    YARA_CLEAN_FORMAT=$(echo "$CLEAN_YARA_RESULT" | tr '\n' '|' | sed 's/|$//')
+    # เขียน Log แบบ parseable JSON สำหรับ Wazuh Decoder (ส่งกลับ SOC กลาง)
+    # กรองเอาแค่ชื่อ Rule ไม่เอา path ใน container
+    YARA_CLEAN_FORMAT=$(echo "$CLEAN_YARA_RESULT" | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')
     
     # 1. Output สำหรับ YARA Alert (Rule 110900)
-    echo "wazuh-yara: INFO - Scan result: $YARA_CLEAN_FORMAT $ABS_FILE" >> "$LOGFILE"
+    echo "{\"wazuh_yara\": {\"level\": \"INFO\", \"scan_result\": \"$YARA_CLEAN_FORMAT\", \"file\": \"$ABS_FILE\"}}" >> "$LOGFILE"
     
     # 2. Output สำหรับ Quarantine Alert (Rule 110901)
-    echo "QUARANTINED src=$ABS_FILE dest=DELETED sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT" >> "$LOGFILE"
+    echo "{\"wazuh_yara\": {\"level\": \"QUARANTINE\", \"src\": \"$ABS_FILE\", \"dest\": \"DELETED\", \"sha256\": \"$SHA256\", \"md5\": \"$MD5\", \"yara_match\": \"$YARA_CLEAN_FORMAT\"}}" >> "$LOGFILE"
 else
     if [ $DOCKER_EXIT_CODE -ne 0 ]; then
         YARA_ERR_CLEAN=$(echo "$YARA_RESULT" | tr '\n' ' ' | sed 's/  */ /g')
