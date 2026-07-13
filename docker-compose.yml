@@ -17,3 +17,8 @@ services:
       - /dev/log:/dev/log
     env_file:
       - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
