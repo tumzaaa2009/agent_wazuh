@@ -1,22 +1,17 @@
-FROM oven/bun:1
+FROM oven/bun:1-debian
 
 WORKDIR /app
 
 COPY package.json index.ts ./
-# Install necessary system dependencies (curl for healthcheck, iptables for firewall-drop, yara for scanning, unzip for configs)
+
 RUN apt-get update && apt-get install -y \
     curl \
     iptables \
     yara \
     unzip \
-    systemd \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Add wazuh user and group to match host for agent_control permissions
-
-# Run bun install
 RUN bun install
 
-# Command requires root privileges for iptables
-# In production, run with --cap-add=NET_ADMIN
 CMD ["bun", "run", "index.ts"]

@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update ข้อมูล cdb list แยก hash ip domain fixbug v7 ////
+//patch update ข้อมูล cdb list แยก hash ip domain fixbug checkrule gggggg////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
