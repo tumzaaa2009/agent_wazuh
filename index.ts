@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update ข้อมูล cdb list แยก hash ip domain fixbug checkrule testจ้าาาา firewall updat bootsssgggg ////
+//patch update ข้อมูล cdb list แยก hash ip domain fixbug checkrule testจ้าาาา firewall updat smartblock ////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -165,56 +165,115 @@ async function processQueueItem(item: any, ws?: WebSocket) {
       await $`logger -t HOS-Edge-Connector ${dropMsg}`.catch((err: any) => console.error("Syslog error:", err));
 
       try {
-        if (agent_id === "000") {
-          // 1. Local Agent (000): Execute the Active Response binary directly with JSON payload
-          let executable = "/var/ossec/active-response/bin/firewall-drop";
-          if (existsSync("/var/ossec/active-response/bin/firewalld-drop")) {
-             executable = "/var/ossec/active-response/bin/firewalld-drop";
-          }
-          
-          const arPayload = JSON.stringify({
-            version: 1,
-            origin: { name: "edge-connector", module: "active-response" },
-            command: "add",
-            parameters: {
-              extra_args: [],
-              alert: { data: { srcip: srcip } },
-              program: executable.replace("/var/ossec/", "")
-            }
-          });
+          // Detect OS dynamically
+          let isWindows = false;
+          let isUbuntu = false;
+          let isCentosAlma = false;
 
-          console.log(`🚀 Executing local AR: ${executable} with payload: ${arPayload}`);
-          
-          try {
-            const child = Bun.spawn([executable], { stdin: "pipe" });
-            child.stdin.write(arPayload);
-            child.stdin.flush();
-            child.stdin.end();
-            await child.exited;
-            console.log(`✅ Successfully executed local block for ${srcip}`);
-          } catch (spawnErr) {
-            console.error(`❌ Failed to spawn local AR script:`, spawnErr);
-          }
-        } else {
-          // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
-          // Detect agent OS first
-          const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
-          const isWindows = infoOutput.toLowerCase().includes('windows');
-
-          const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-
-          let arName = 'firewalld-drop';
-          if (isWindows) {
-            const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
-            arName = match ? match[1] : 'netsh';
+          if (agent_id === "000") {
+            try {
+              const osRelease = await Bun.file('/etc/os-release').text();
+              const osLower = osRelease.toLowerCase();
+              if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
+              else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
+            } catch(e) {}
           } else {
-            const match = arOutput.match(/Response name: ((?:firewalld?-drop|host-deny)\d*)/);
-            arName = match ? match[1] : 'firewalld-drop';
+            try {
+              const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
+              const osLine = infoOutput.split('\n').find((l: string) => l.toLowerCase().includes('operating system:'));
+              if (osLine) {
+                const osLower = osLine.toLowerCase();
+                if (osLower.includes('windows')) isWindows = true;
+                else if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
+                else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
+              }
+            } catch(e) {}
           }
 
-          await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
-        }
+          if (agent_id === "000") {
+            // 1. Local Agent (000)
+            let executable = "/var/ossec/active-response/bin/firewall-drop"; // Default iptables for Ubuntu/Debian
+            
+            // If it's CentOS/Alma, or firewalld is explicitly installed, use firewalld-drop
+            if (isCentosAlma || existsSync('/usr/bin/firewall-cmd') || existsSync('/bin/firewall-cmd')) {
+               executable = "/var/ossec/active-response/bin/firewalld-drop";
+            }
+            
+            const arPayload = JSON.stringify({
+              version: 1,
+              origin: { name: "edge-connector", module: "active-response" },
+              command: "add",
+              parameters: {
+                extra_args: [],
+                alert: { data: { srcip: srcip } },
+                program: executable.replace("/var/ossec/", "")
+              }
+            });
+
+            console.log(`🚀 Executing local AR: ${executable} on ${isUbuntu ? 'Ubuntu' : (isCentosAlma ? 'CentOS/Alma' : 'Linux')} with payload: ${arPayload}`);
+            
+            try {
+              const child = Bun.spawn([executable], { stdin: "pipe", stdout: "pipe" });
+              child.stdin.write(arPayload + "\n");
+              child.stdin.flush();
+
+              const reader = child.stdout.getReader();
+              const decoder = new TextDecoder();
+
+              (async () => {
+                try {
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const text = decoder.decode(value);
+                    if (text.includes("check_keys")) {
+                      const continueMsg = JSON.stringify({
+                        version: 1,
+                        origin: { name: "edge-connector", module: "active-response" },
+                        command: "continue",
+                        parameters: { keys: [srcip] }
+                      });
+                      child.stdin.write(continueMsg + "\n");
+                      child.stdin.flush();
+                      child.stdin.end();
+                      break;
+                    }
+                  }
+                } catch (e) {
+                  console.error("Error reading AR stdout:", e);
+                }
+              })();
+
+              await child.exited;
+              console.log(`✅ Successfully executed local block for ${srcip}`);
+            } catch (spawnErr) {
+              console.error(`❌ Failed to spawn local AR script:`, spawnErr);
+            }
+          } else {
+            // 2. Remote Agent (Agent 001+)
+            let arName = 'firewall-drop';
+            try {
+              const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
+              if (isWindows) {
+                const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
+                arName = match ? match[1] : 'netsh';
+              } else if (isCentosAlma) {
+                const match = arOutput.match(/Response name: (firewalld?-drop\d*)/);
+                arName = match ? match[1] : 'firewalld-drop';
+              } else {
+                const match = arOutput.match(/Response name: (firewall-drop\d*|host-deny\d*)/);
+                arName = match ? match[1] : 'firewall-drop';
+              }
+            } catch (e) {
+              if (isWindows) arName = 'netsh';
+              else if (isCentosAlma) arName = 'firewalld-drop';
+              else arName = 'firewall-drop';
+            }
+
+            console.log(`🚀 Triggering ${arName} on remote agent ${agent_id} (${isWindows ? 'Windows' : (isUbuntu ? 'Ubuntu' : 'CentOS/Linux')}) to block ${srcip}`);
+            await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
+            console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id}`);
+          }
       } catch (err) {
         console.error(`❌ Failed to trigger active response via agent_control:`, err);
       }
@@ -930,13 +989,13 @@ async function fetchPoliciesV2() {
 fetchPoliciesV2();
 setInterval(fetchPoliciesV2, 5 * 60 * 1000);
 
-// Initial fetch and set interval for daily YARA updates (24h)
+// Initial fetch and set interval for daily YARA updates (every 1 min for testing)
 fetchYaraRules();
-setInterval(fetchYaraRules, 24 * 60 * 60 * 1000);
+setInterval(fetchYaraRules, 60 * 1000);
 
-// Initial fetch and set interval for daily SOC Configs updates (24h)
+// Initial fetch and set interval for daily SOC Configs updates (every 1 min for testing)
 fetchSocConfigs();
-setInterval(fetchSocConfigs, 24 * 60 * 60 * 1000);
+setInterval(fetchSocConfigs, 60 * 1000);
 
 // Run Rule Policy Sync periodically (every 1 min)
 syncRulePolicy();
