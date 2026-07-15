@@ -1,10 +1,12 @@
-FROM oven/bun:1-debian
+FROM oven/bun:1
 
 WORKDIR /app
 
-COPY package.json index.ts ./
+COPY package.json boot.ts index.ts ./
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get clean && \
+    apt-get update -o Acquire::Check-Valid-Until=false --allow-releaseinfo-change && \
+    apt-get install -y \
     curl \
     iptables \
     yara \
@@ -14,4 +16,4 @@ RUN apt-get update && apt-get install -y \
 
 RUN bun install
 
-CMD ["bun", "run", "index.ts"]
+CMD ["bun", "run", "boot.ts"]

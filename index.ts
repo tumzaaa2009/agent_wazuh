@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update ข้อมูล cdb list แยก hash ip domain fixbug checkrule gggggg////
+//patch update ข้อมูล cdb list แยก hash ip domain fixbug checkrule testจ้าาาา firewall updat bootsssgggg ////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -38,6 +38,12 @@ function setupDummyLists() {
   }
 }
 setupDummyLists();
+
+function getWazuhLogTimestamp() {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
@@ -160,18 +166,35 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
       try {
         if (agent_id === "000") {
-          // 1. Wazuh Manager (Agent 000): Use local log file injection to trigger native local rule
-          const logEntry = {
-            timestamp: new Date().toISOString(),
-            source: "central_soc",
-            command: "firewall-drop",
-            srcip: srcip,
-            timeout: timeout || 3600,
-            log_id: log_id,
-            agent: { id: "000", name: agent_name || "Manager" }
-          };
-          await appendFile('/var/ossec/logs/active-responses.log', JSON.stringify(logEntry) + '\n');
-          console.log(`✅ Successfully wrote log for Manager (000) to trigger local block for ${srcip}`);
+          // 1. Local Agent (000): Execute the Active Response binary directly with JSON payload
+          let executable = "/var/ossec/active-response/bin/firewall-drop";
+          if (existsSync("/var/ossec/active-response/bin/firewalld-drop")) {
+             executable = "/var/ossec/active-response/bin/firewalld-drop";
+          }
+          
+          const arPayload = JSON.stringify({
+            version: 1,
+            origin: { name: "edge-connector", module: "active-response" },
+            command: "add",
+            parameters: {
+              extra_args: [],
+              alert: { data: { srcip: srcip } },
+              program: executable.replace("/var/ossec/", "")
+            }
+          });
+
+          console.log(`🚀 Executing local AR: ${executable} with payload: ${arPayload}`);
+          
+          try {
+            const child = Bun.spawn([executable], { stdin: "pipe" });
+            child.stdin.write(arPayload);
+            child.stdin.flush();
+            child.stdin.end();
+            await child.exited;
+            console.log(`✅ Successfully executed local block for ${srcip}`);
+          } catch (spawnErr) {
+            console.error(`❌ Failed to spawn local AR script:`, spawnErr);
+          }
         } else {
           // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
           // Detect agent OS first
@@ -180,13 +203,13 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
           const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
 
-          let arName = 'firewall-drop';
+          let arName = 'firewalld-drop';
           if (isWindows) {
             const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
             arName = match ? match[1] : 'netsh';
           } else {
-            const match = arOutput.match(/Response name: (firewall-drop\d*)/);
-            arName = match ? match[1] : 'firewall-drop';
+            const match = arOutput.match(/Response name: ((?:firewalld?-drop|host-deny)\d*)/);
+            arName = match ? match[1] : 'firewalld-drop';
           }
 
           await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
@@ -299,9 +322,6 @@ function connect() {
   ws.onopen = () => {
     console.log("✅ Connected to Central SOC WebSocket!");
 
-    // Trigger self-update check instantly upon connection/reconnection
-    checkSelfUpdate();
-
     const registerMsg = {
       type: "register",
       hospital_code: HOSPITAL_CODE,
@@ -349,7 +369,14 @@ function connect() {
       // Handle agent patch update action
       if (data.action === "update_agent") {
         console.log("📥 Received update_agent trigger from Central SOC");
-        await checkSelfUpdate();
+        console.log("🔄 Deleting agent_version.txt to force edge-updater to pull new version...");
+        try {
+          if (existsSync(`${import.meta.dir}/agent_version.txt`)) {
+              await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
+          }
+        } catch (e) {
+          console.error("❌ Failed to delete agent_version.txt:", e);
+        }
       }
 
       // 2. Handle new Array payload format (if pushed via WS)
@@ -730,45 +757,11 @@ async function fetchSocConfigs() {
 // ---------------------------------------------------------
 async function deployYaraWpk() {
   // Deprecated: YARA deployment is now handled natively via Docker and agent.conf
-  return;
 }
 
 // ---------------------------------------------------------
-// Self-Updater Mechanism
+// Self-Updater is now handled by edge-updater container
 // ---------------------------------------------------------
-async function checkSelfUpdate() {
-  const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
-  try {
-    console.log(`📥 Querying edge index.ts for latest agent patches...`);
-    const res = await fetch(`${CENTRAL_API}/api/v1/edge-connector/version`);
-    if (res.ok) {
-      const data = await res.json();
-      const currentDir = import.meta.dir;
-      const versionFile = `${currentDir}/agent_version.txt`;
-
-      let localVersion = "";
-      if (existsSync(versionFile)) {
-        const content = await Bun.file(versionFile).text();
-        localVersion = content.trim();
-      }
-
-      if (data.success && data.version && data.version !== localVersion) {
-        console.log(`🚀 [UPDATE] New version detected! Remote: ${data.version}, Local: ${localVersion}`);
-        console.log(`📥 Downloading new index.ts...`);
-        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/edge-connector/script`);
-        if (scriptRes.ok) {
-          const scriptText = await scriptRes.text();
-          await Bun.write(`${currentDir}/index.ts`, scriptText);
-          await Bun.write(versionFile, data.version);
-          console.log(`✅ [UPDATE] Successfully overwrote local script and agent_version.txt. Exiting so container automatically restarts...`);
-          process.exit(1);
-        }
-      }
-    }
-  } catch (err) {
-    console.error("❌ Failed to check for self-updates:", err);
-  }
-}
 
 // ---------------------------------------------------------
 // Custom SOC Updater Mechanism
@@ -952,10 +945,6 @@ setInterval(syncRulePolicy, 60000);
 // Run WPK Deployment Orchestrator periodically (every 5 mins)
 deployYaraWpk();
 setInterval(deployYaraWpk, 5 * 60 * 1000);
-
-// Run Self-Updater periodically (every 5 mins)
-checkSelfUpdate();
-setInterval(checkSelfUpdate, 5 * 60 * 1000);
 
 // Run Custom SOC Updater periodically (every 5 mins)
 checkCustomSocUpdate();

@@ -2,6 +2,7 @@ services:
   edge-connector:
     build: .
     container_name: hospital-edge-connector
+    command: ["bun", "--watch", "run", "index.ts"]
     restart: unless-stopped
     network_mode: "host"
     pid: "host"
@@ -22,3 +23,19 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+
+  edge-updater:
+    build: .
+    container_name: hospital-edge-updater
+    command: ["bun", "run", "boot.ts"]
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+      - /app/node_modules
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "1"
