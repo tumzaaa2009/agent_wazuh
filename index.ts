@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//ปวดกระบาล V6////
+//ปวดกระบาล V789////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -542,11 +542,11 @@ async function pollApiQueue() {
             });
             console.log(`🗑️ Cleared queue for ${item.srcip}`);
           }
-          
+
           // If there are more items in the queue, fetch the next batch quickly
           if (data.total_queued && data.total_queued > queues.length) {
-             console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
-             setTimeout(pollApiQueue, 2000);
+            console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
+            setTimeout(pollApiQueue, 2000);
           }
         }
       }
