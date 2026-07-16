@@ -62,7 +62,7 @@ async function checkAndApplyUpdate(): Promise<boolean> {
 async function checkCustomSocUpdate() {
     const versionFileSOC = `${dataDir}/version_custom_soc.txt`;
     exec(`mkdir -p /var/hos-edge-connector`);
-    const scriptFileSOC = `/var/hos-edge-connector/custom-soc`;
+    const scriptFileSOC = `${dataDir}/custom-soc`;
     const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
 
     try {
