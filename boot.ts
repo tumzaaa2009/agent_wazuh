@@ -15,8 +15,8 @@ const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const API_KEY = process.env.API_KEY || "";
 
 const currentDir = import.meta.dir;
-const dataDir = path.join(currentDir, "..");
-const versionFile = path.join(dataDir, '.edge_agent_version');
+const dataDir = currentDir === '/app' ? currentDir : path.join(currentDir, "..");
+const versionFile = path.join(dataDir, 'agent_version.txt');
 const scriptFile = path.join(currentDir, 'index.ts');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,7 +60,7 @@ async function checkAndApplyUpdate(): Promise<boolean> {
 }
 
 async function checkCustomSocUpdate() {
-    const versionFileSOC = `${dataDir}/.edge_version_custom_soc`;
+    const versionFileSOC = `${dataDir}/version_custom_soc.txt`;
     exec(`mkdir -p /var/hos-edge-connector`);
     const scriptFileSOC = `/var/hos-edge-connector/custom-soc`;
     const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
@@ -114,7 +114,7 @@ async function fetchYaraRules() {
             const versionRes = await fetch(`${YARA_API_URL}/version`, { signal: AbortSignal.timeout(5000) });
             if (versionRes.ok) {
                 const vData = await versionRes.json();
-                const versionFile = `${dataDir}/.edge_yara_rules_version`;
+                const versionFile = `${dataDir}/yara_rules_version.txt`;
                 if (existsSync(versionFile)) {
                     const content = await Bun.file(versionFile).text();
                     let localVersion = content.split('\n')[0].trim().replace(" used", "");
@@ -181,7 +181,7 @@ async function fetchSocConfigs() {
         if (versionRes.ok) {
             const vData = await versionRes.json();
             if (vData.success && vData.version) {
-                const versionFile = `${dataDir}/.edge_version_wazuh_configs`;
+                const versionFile = `${dataDir}/version_wazuh_configs.txt`;
                 if (existsSync(versionFile)) {
                     const localVersion = (await Bun.file(versionFile).text()).split('\n')[0]?.trim() || "";
                     const remoteVersion = String(vData.version).split('\n')[0]?.trim() || "";
@@ -225,35 +225,17 @@ async function fetchSocConfigs() {
 
 async function autoInjectWazuhConfigs(data: any) {
     if (!data.mockup_agent && !data.mockup_manager) return;
-    const ossecConfPath = '/var/ossec/etc/manager_mockup_boot.xml';
-    const agentConfPath = '/var/ossec/etc/shared/default/agent_mockup_boot.xml';
+    const ossecConfPath = '/var/ossec/etc/ossec.conf';
+    const agentConfPath = '/var/ossec/etc/shared/default/agent.conf';
     try {
-        let confContent = await Bun.file(ossecConfPath).text();
         let managerMockup = data.mockup_manager ? Buffer.from(data.mockup_manager, 'base64').toString('utf-8') : "";
         let agentMockup = data.mockup_agent ? Buffer.from(data.mockup_agent, 'base64').toString('utf-8') : "";
 
+        // 1. Update Manager Config (ossec.conf) — Full Overwrite
         if (managerMockup) {
-            const START = '<!-- INJECTED BY EDGE CONNECTOR';
-            const mockupStartIdx = managerMockup.indexOf(START);
-            if (mockupStartIdx !== -1) managerMockup = managerMockup.substring(mockupStartIdx);
-
-            const END = '<!-- USER CUSTOM CONFIGURATION BLOCK ENDS HERE   -->';
-            let startIdx = confContent.indexOf(START);
-            let endIdx = confContent.indexOf(END);
-
-            while (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-                let realStartIdx = startIdx;
-                const precedingText = confContent.substring(0, startIdx);
-                const match = precedingText.match(/(?:<!-- ========================================== -->\s*)+$/);
-                if (match) realStartIdx -= match[0].length;
-                confContent = confContent.substring(0, realStartIdx) + confContent.substring(endIdx + END.length);
-                startIdx = confContent.indexOf(START);
-                endIdx = confContent.indexOf(END);
-            }
-
-            confContent = confContent.replace('</ossec_config>', `\n${managerMockup}\n</ossec_config>`);
-            await Bun.write(ossecConfPath, confContent);
-            await $`chown root:125 ${ossecConfPath} && chmod 660 ${ossecConfPath}`.quiet().catch(() => { });
+            console.log("⚙️ Overwriting ossec.conf with central SOC mockup...");
+            await Bun.write(ossecConfPath, managerMockup);
+            await $`chown root:wazuh ${ossecConfPath} && chmod 660 ${ossecConfPath}`.quiet().catch(() => { });
         }
 
         if (agentMockup) {
@@ -321,7 +303,7 @@ main().catch((err) => {
 async function syncRulePolicy() {
     try {
         console.log(`[BOOT] 📥 Querying SOC for latest policy queues...`);
-        const versionFile = `${dataDir}/.edge_soc_rules_version`;
+        const versionFile = `${dataDir}/soc_rules_version.txt`;
         let currentTopLine = '';
         if (existsSync(versionFile)) {
             const content = await Bun.file(versionFile).text();
@@ -364,8 +346,8 @@ async function syncRulePolicy() {
                 const configData = await configRes.json();
                 const { agent_xml, manager_xml, wazuh_files } = configData;
 
-                await Bun.write('/var/ossec/etc/shared/default/agent_mockup_boot.xml', agent_xml);
-                await Bun.write('/var/ossec/etc/manager_mockup_boot.xml', manager_xml);
+                await Bun.write('/var/ossec/etc/shared/default/agent_mockup.xml', agent_xml);
+                await Bun.write('/var/ossec/etc/manager_mockup.xml', manager_xml);
 
                 if (wazuh_files && Array.isArray(wazuh_files)) {
                     for (const file of wazuh_files) {
@@ -380,6 +362,12 @@ async function syncRulePolicy() {
                         }
                     }
                 }
+
+                // Inject the newly downloaded configs into ossec.conf and agent.conf
+                await autoInjectWazuhConfigs({
+                    mockup_manager: manager_xml ? Buffer.from(manager_xml).toString('base64') : null,
+                    mockup_agent: agent_xml ? Buffer.from(agent_xml).toString('base64') : null
+                });
 
                 await Bun.write(versionFile, `${targetHash} used\n`);
                 console.log(`[BOOT] ✅ Rules applied successfully for ${targetHash}`);
