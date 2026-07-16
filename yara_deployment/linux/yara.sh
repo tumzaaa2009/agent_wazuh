@@ -5,7 +5,6 @@
 # =============================================================
 
 LOGFILE="/var/ossec/logs/active-responses.log"
-YARA_RULES="/var/ossec/etc/shared/default/yara_rules.yar"
 
 echo "$(date -Is) yara.sh: [DEBUG] Script triggered." >> "$LOGFILE"
 
@@ -22,11 +21,19 @@ fi
 # Validate
 if [ -z "$FILEPATH" ] || [ "$FILEPATH" == "null" ]; then
     echo "$(date -Is) yara.sh: [ERROR] No valid file path parsed from input." >> "$LOGFILE"
+
+    logger -p local6.err -t wazuh_yara -- \
+    "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"no_file_path\"}"
+
     exit 0
 fi
 
 if [ ! -f "$FILEPATH" ]; then
     echo "$(date -Is) yara.sh: [ERROR] File not found on disk path=$FILEPATH" >> "$LOGFILE"
+
+    logger -p local6.err -t wazuh_yara -- \
+    "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"file_not_found\",\"file\":\"$FILEPATH\"}"
+
     exit 0
 fi
 
@@ -37,23 +44,24 @@ echo "$(date -Is) yara.sh: [INFO] SCAN_START file=$ABS_FILE" >> "$LOGFILE"
 
 YARA_RULES="/var/ossec/etc/shared/yara_rules.yar"
 if [ ! -f "$YARA_RULES" ]; then
-    # Fallback to default for older agents or direct manager run
     YARA_RULES="/var/ossec/etc/shared/default/yara_rules.yar"
+
     if [ ! -f "$YARA_RULES" ]; then
-        echo "$(date -Is) yara.sh: [ERROR] YARA rules not found at $YARA_RULES" >> "$LOGFILE"
-        echo "wazuh-yara: ERROR - YARA scan failed. Result: rules not found at $YARA_RULES"
+        echo "$(date -Is) yara.sh: [ERROR] YARA rules not found." >> "$LOGFILE"
+
+        logger -p local6.err -t wazuh_yara -- \
+        "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"rules_not_found\"}"
+
         exit 1
     fi
 fi
 
 echo "$(date -Is) yara.sh: [INFO] SCAN_START file=$ABS_FILE. Waiting 2s for IO sync..." >> "$LOGFILE"
 
-# Fix race condition
 sleep 2
 
 echo "$(date -Is) yara.sh: [DEBUG] Executing Docker YARA container..." >> "$LOGFILE"
 
-# ============ Docker YARA Scan ============
 YARA_RESULT=$(docker run --rm \
     -u root \
     -v "$ABS_FILE":/scan/target_file:ro \
@@ -63,46 +71,61 @@ YARA_RESULT=$(docker run --rm \
     -r /opt/yara/rules/yara_rules.yar /scan/target_file 2>&1)
 
 DOCKER_EXIT_CODE=$?
+
 echo "$(date -Is) yara.sh: [DEBUG] Docker execution finished. Exit Code: $DOCKER_EXIT_CODE" >> "$LOGFILE"
 
-# ตรวจสอบว่าเจอไวรัสหรือไม่ (ถ้าไม่มี output หรือมีแต่ warning มักจะ clean, แต่ถ้าเจอจะ print ชื่อ rule)
-# เราจะกรอง warning ออกไปก่อน (บางที YARA ปริ้นท์ warning)
-CLEAN_YARA_RESULT=$(echo "$YARA_RESULT" | grep -v "warning")
+CLEAN_YARA_RESULT=$(echo "$YARA_RESULT" | grep -vi warning)
 
-if [ -n "$CLEAN_YARA_RESULT" ] && [ $DOCKER_EXIT_CODE -eq 0 ]; then
+if [ -n "$CLEAN_YARA_RESULT" ] && [ "$DOCKER_EXIT_CODE" -eq 0 ]; then
+
     echo "$(date -Is) yara.sh: [WARN] MALWARE_DETECTED file=$FILENAME result=$CLEAN_YARA_RESULT" >> "$LOGFILE"
 
-    # คำนวณ Hash ก่อนลบ
     SHA256=$(sha256sum "$ABS_FILE" | awk '{print $1}')
     MD5=$(md5sum "$ABS_FILE" | awk '{print $1}')
 
     echo "$(date -Is) yara.sh: [DEBUG] Hashes computed. SHA256=$SHA256" >> "$LOGFILE"
-    
-    # ลบไฟล์ต้นฉบับ (Quarantine by deletion)
+
+    YARA_CLEAN_FORMAT=$(echo "$CLEAN_YARA_RESULT" | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')
+
+    logger -p local6.notice -t wazuh_yara -- \
+    "{\"event\":\"yara\",\"action\":\"detect\",\"level\":\"INFO\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\"}"
+
     rm -f "$ABS_FILE"
+
     if [ ! -f "$ABS_FILE" ]; then
+
         echo "$(date -Is) yara.sh: [DEBUG] File successfully deleted." >> "$LOGFILE"
+
+        echo "$(date -Is) wazuh-yara: src=$ABS_FILE dest=DELETED sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT cdb_format=$SHA256:$YARA_CLEAN_FORMAT" >> "$LOGFILE"
     else
+
         echo "$(date -Is) yara.sh: [ERROR] Failed to delete file." >> "$LOGFILE"
+
+        logger -p local6.err -t wazuh_yara -- \
+        "{\"event\":\"yara\",\"action\":\"delete_failed\",\"level\":\"ERROR\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\"}"
+
     fi
 
-    # เขียน Log แบบ parseable JSON สำหรับ Wazuh Decoder (ส่งกลับ SOC กลาง)
-    # กรองเอาแค่ชื่อ Rule ไม่เอา path ใน container
-    YARA_CLEAN_FORMAT=$(echo "$CLEAN_YARA_RESULT" | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')
-    
-    # 1. Output สำหรับ YARA Alert (Rule 110900)
-    echo "{\"wazuh_yara\": {\"level\": \"INFO\", \"scan_result\": \"$YARA_CLEAN_FORMAT\", \"file\": \"$ABS_FILE\"}}" >> "$LOGFILE"
-    
-    # 2. Output สำหรับ Quarantine Alert (Rule 110901)
-    echo "{\"wazuh_yara\": {\"level\": \"QUARANTINE\", \"src\": \"$ABS_FILE\", \"dest\": \"DELETED\", \"sha256\": \"$SHA256\", \"md5\": \"$MD5\", \"yara_match\": \"$YARA_CLEAN_FORMAT\"}}" >> "$LOGFILE"
 else
-    if [ $DOCKER_EXIT_CODE -ne 0 ]; then
+
+    if [ "$DOCKER_EXIT_CODE" -ne 0 ]; then
+
         YARA_ERR_CLEAN=$(echo "$YARA_RESULT" | tr '\n' ' ' | sed 's/  */ /g')
-        echo "$(date -Is) yara.sh: [ERROR] YARA scan failed or container error. Result: $YARA_RESULT" >> "$LOGFILE"
-        echo "wazuh-yara: ERROR - YARA scan failed. Result: $YARA_ERR_CLEAN" >> "$LOGFILE"
+
+        echo "$(date -Is) yara.sh: [ERROR] YARA scan failed. Result: $YARA_RESULT" >> "$LOGFILE"
+
+        logger -p local6.err -t wazuh_yara -- \
+        "{\"event\":\"yara\",\"action\":\"scan_error\",\"level\":\"ERROR\",\"reason\":\"$YARA_ERR_CLEAN\",\"file\":\"$ABS_FILE\"}"
+
     else
+
         echo "$(date -Is) yara.sh: [INFO] CLEAN file=$FILENAME" >> "$LOGFILE"
+
+        logger -p local6.info -t wazuh_yara -- \
+        "{\"event\":\"yara\",\"action\":\"clean\",\"level\":\"INFO\",\"file\":\"$ABS_FILE\"}"
+
     fi
+
 fi
 
 echo "$(date -Is) yara.sh: [DEBUG] Script completed." >> "$LOGFILE"

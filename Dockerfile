@@ -5,13 +5,10 @@ WORKDIR /app
 COPY package.json boot.ts index.ts ./
 
 RUN apt-get clean && \
-    apt-get update -o Acquire::Check-Valid-Until=false --allow-releaseinfo-change && \
+    apt-get update && \
     apt-get install -y \
-    curl \
     iptables \
     yara \
-    unzip \
-    jq \
     && rm -rf /var/lib/apt/lists/*
 
 RUN bun install
