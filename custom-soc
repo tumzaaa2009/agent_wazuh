@@ -1,180 +1,249 @@
 #!/var/ossec/framework/python/bin/python3
+
 import sys
 import json
 import re
 import requests
 import urllib3
-import os
 
-# Suppress SSL warnings (self-signed cert environment)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# =========================================================================
-# Read environment configuration from .env file update >6
-# =========================================================================
-env_file = "/var/hos-edge-connector/.env"
-env_vars = {}
-try:
-    with open(env_file, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"): continue
-            match = re.match(r'^([^=]+)=(.*)$', line)
-            if match:
-                key = match.group(1).strip()
-                val = match.group(2).strip().split('#')[0].strip()
-                if val.startswith('"') and val.endswith('"'): val = val[1:-1]
-                elif val.startswith("'") and val.endswith("'"): val = val[1:-1]
-                env_vars[key] = val
-except Exception:
-    pass
+# ============================================================================
+# Load .env ปวดกระบาล V10
+# ============================================================================
 
-API_URL = "https://rh4cloudcenter.moph.go.th/api/v1/alerts"
-MALWARE_API_URL = "https://rh4cloudcenter.moph.go.th/api/v1/malware-events"
+ENV_FILE = "/var/hos-edge-connector/.env"
 
-API_KEY = env_vars.get("API_KEY", "KEY_UNKNOWN")
-HOSPITAL_CODE = env_vars.get("HOSPITAL_CODE", "00000")
-HOSPITAL_NAME = env_vars.get("HOSPITAL_NAME", "Unknown Hospital")
+
+def write_log(message):
+    with open("/var/ossec/logs/integrations.log", "a") as log:
+        log.write(f"{message}\n")
+
+
+def load_env(path):
+    env = {}
+
+    try:
+        with open(path, "r") as f:
+            for line in f:
+
+                line = line.strip()
+
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+
+                key = key.strip()
+                value = value.split("#")[0].strip()
+
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+
+                elif value.startswith("'") and value.endswith("'"):
+                    value = value[1:-1]
+
+                env[key] = value
+
+    except Exception as e:
+        write_log(f"[custom-soc] ERROR reading .env : {e}")
+
+    return env
+
+
+env = load_env(ENV_FILE)
+
+API_BASE = env.get(
+    "API_URL",
+    "https://rh4cloudcenter.moph.go.th/api/v1"
+).rstrip("/")
+
+API_URL = f"{API_BASE}/alerts"
+MALWARE_API_URL = f"{API_BASE}/malware-events"
+
+API_KEY = env.get("API_KEY", "")
+HOSPITAL_CODE = env.get("HOSPITAL_CODE", "")
+HOSPITAL_NAME = env.get("HOSPITAL_NAME", "")
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
     "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    "User-Agent": "Mozilla/5.0"
 }
 
-def report_malware_event(alert: dict, full_log: str):
-    """Parse YARA or other malware logs and report malware hash event to central SOC."""
+if API_KEY:
+    write_log("[custom-soc] Configuration loaded")
+else:
+    write_log("[custom-soc] ERROR: API_KEY missing from .env")
+
+
+# ============================================================================
+# Malware Event
+# ============================================================================
+
+def report_malware_event(alert, full_log):
+
     sha256 = ""
     md5 = ""
     filepath = ""
-    yara_rule_matched = ""
-    
-    # 1. Try to extract from alert decoded data (e.g. YARA custom decoder)
+    yara_rule = ""
+
     data = alert.get("data", {})
+
     if isinstance(data, dict):
         sha256 = data.get("sha256", "")
         md5 = data.get("md5", "")
         filepath = data.get("src", "")
-        yara_rule_matched = data.get("yara_match", "")
-        
-    # 2. Try to parse JSON from full_log
+        yara_rule = data.get("yara_match", "")
+
     if not sha256:
         try:
-            json_start = full_log.find('{')
-            if json_start != -1:
-                js_data = json.loads(full_log[json_start:])
-                wy = js_data.get("wazuh_yara", {})
+            pos = full_log.find("{")
+
+            if pos != -1:
+                js = json.loads(full_log[pos:])
+
+                wy = js.get("wazuh_yara", {})
+
                 sha256 = wy.get("sha256", "")
                 md5 = wy.get("md5", "")
                 filepath = wy.get("src", wy.get("file", ""))
-                yara_rule_matched = wy.get("yara_match", wy.get("scan_result", ""))
+                yara_rule = wy.get(
+                    "yara_match",
+                    wy.get("scan_result", "")
+                )
+
         except Exception:
             pass
-            
-    # 3. Try to extract from syscheck (FIM)
+
     syscheck = alert.get("syscheck", {})
-    if isinstance(syscheck, dict) and syscheck:
-        if not filepath:
-            filepath = syscheck.get("path", "")
-        if not sha256:
-            sha256 = syscheck.get("sha256_after", "")
-        if not md5:
-            md5 = syscheck.get("md5_after", "")
 
-    # 4. Try to extract from Sysmon / Windows EventData
+    if isinstance(syscheck, dict):
+        filepath = filepath or syscheck.get("path", "")
+        sha256 = sha256 or syscheck.get("sha256_after", "")
+        md5 = md5 or syscheck.get("md5_after", "")
+
     win = alert.get("win", {})
-    eventdata = win.get("eventdata", {}) if isinstance(win, dict) else {}
-    if isinstance(eventdata, dict) and eventdata:
-        if not filepath:
-            filepath = eventdata.get("image", "")
-        hashes_str = eventdata.get("hashes", "")
-        if hashes_str:
+    eventdata = win.get("eventdata", {})
+
+    if isinstance(eventdata, dict):
+
+        filepath = filepath or eventdata.get("image", "")
+
+        hashes = eventdata.get("hashes", "")
+
+        if hashes:
+
             if not sha256:
-                sha256_match = re.search(r'SHA256=([a-fA-F0-9]+)', hashes_str, re.IGNORECASE)
-                if sha256_match:
-                    sha256 = sha256_match.group(1)
+                m = re.search(r"SHA256=([A-Fa-f0-9]+)", hashes)
+                if m:
+                    sha256 = m.group(1)
+
             if not md5:
-                md5_match = re.search(r'MD5=([a-fA-F0-9]+)', hashes_str, re.IGNORECASE)
-                if md5_match:
-                    md5 = md5_match.group(1)
+                m = re.search(r"MD5=([A-Fa-f0-9]+)", hashes)
+                if m:
+                    md5 = m.group(1)
 
-    # 5. Fallback to regex for plaintext YARA/quarantine logs
-    if not sha256:
-        sha256_match = re.search(r'sha256=([a-fA-F0-9]+)', full_log)
-        sha256 = sha256_match.group(1) if sha256_match else ""
-    if not md5:
-        md5_match = re.search(r'md5=([a-fA-F0-9]+)', full_log)
-        md5 = md5_match.group(1) if md5_match else ""
-    if not filepath:
-        src_match = re.search(r'src=([^\s]+)', full_log)
-        filepath = src_match.group(1).strip('"') if src_match else ""
-    if not yara_rule_matched:
-        yara_match = re.search(r'yara_match=(.+?)(?:\s+sha256=|$)', full_log)
-        yara_rule_matched = yara_match.group(1).strip() if yara_match else alert.get("rule", {}).get("description", "")
+    filename = ""
 
-    filename = filepath.split("/")[-1].split("\\")[-1] if filepath else ""
+    if filepath:
+        filename = filepath.replace("\\", "/").split("/")[-1]
 
-    malware_payload = {
+    payload = {
+
         "hospital_code": HOSPITAL_CODE,
         "hospital_name": HOSPITAL_NAME,
+
         "hash_sha256": sha256,
-        "hash_md5":    md5,
-        "filename":    filename,
-        "filepath":    filepath,
-        "yara_rule_matched": yara_rule_matched,
-        "agent_id":    alert.get("agent", {}).get("id",   ""),
-        "agent_name":  alert.get("agent", {}).get("name", ""),
-        "action_taken": "DELETED" if "quarantine" in yara_rule_matched.lower() or "quarantined" in full_log or "quarantine" in str(alert.get("rule", {}).get("groups", "")) else "DETECTED",
-        "timestamp":   alert.get("timestamp", "")
+        "hash_md5": md5,
+
+        "filename": filename,
+        "filepath": filepath,
+
+        "yara_rule_matched": yara_rule,
+
+        "agent_id": alert.get("agent", {}).get("id", ""),
+        "agent_name": alert.get("agent", {}).get("name", ""),
+
+        "timestamp": alert.get("timestamp", "")
     }
 
     try:
-        r2 = requests.post(
+
+        r = requests.post(
             MALWARE_API_URL,
-            json=malware_payload,
+            json=payload,
             headers=HEADERS,
             timeout=10,
             verify=False
         )
-        with open("/var/ossec/logs/integrations.log", "a") as log:
-            log.write(f"[malware-event] Reported {filepath} sha256={malware_payload['hash_sha256']} -> {r2.status_code}\n")
+
+        if r.status_code != 200:
+            write_log(f"[malware-event] HTTP {r.status_code}")
+            write_log(f"[malware-event] {r.text}")
+
     except Exception as e:
-        with open("/var/ossec/logs/integrations.log", "a") as log:
-            log.write(f"[malware-event-fail] {filepath}: {e}\n")
+        write_log(f"[malware-event] ERROR: {e}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    with open("/var/ossec/logs/integrations.log", "a") as log:
-        log.write(f"custom-soc triggered with args: {sys.argv}\n")
 
     if len(sys.argv) < 2:
-        sys.exit(1)
+        return
 
     alert_file = sys.argv[1]
-    with open(alert_file, "r") as f:
-        alert = json.load(f)
+
+    write_log(f"[custom-soc] Triggered: {alert_file}")
+
+    try:
+
+        with open(alert_file, "r") as f:
+            alert = json.load(f)
+
+    except Exception as e:
+        write_log(f"[custom-soc] Cannot read alert: {e}")
+        return
 
     if "_source" in alert:
         alert = alert["_source"]
 
-    rule_level = alert.get("rule", {}).get("level", 0)
-    rule_desc  = alert.get("rule", {}).get("description", "")
-    full_log   = alert.get("full_log", "")
-    rule_groups = alert.get("rule", {}).get("groups", [])
+    rule = alert.get("rule", {})
 
-    # --- 2. YARA/Malware Event Hook ---
-    if "QUARANTINED" in full_log or "yara" in rule_desc.lower() or "malware" in rule_groups or "yara_quarantine" in rule_groups:
-        with open("/var/ossec/logs/integrations.log", "a") as log:
-            log.write(f"[malware-event] Malware/YARA event detected. Reporting to SOC...\n")
+    level = int(rule.get("level", 0))
+    rule_id = rule.get("id", "")
+    description = rule.get("description", "")
+    groups = rule.get("groups", [])
+
+    full_log = alert.get("full_log", "")
+
+    if (
+        "QUARANTINED" in full_log
+        or "yara" in description.lower()
+        or "malware" in groups
+        or "yara_quarantine" in groups
+    ):
         report_malware_event(alert, full_log)
 
-    # --- 3. Standard Alert Forwarding (Level >= 3) ---
-    if int(rule_level) >= 6:
+    if level >= 6:
+
         payload = alert.copy()
-        
+
         payload["hospital_code"] = HOSPITAL_CODE
         payload["hospital_name"] = HOSPITAL_NAME
-        
+
         try:
+
+            write_log(
+                f"[custom-soc] Sending alert (rule={rule_id}, level={level})"
+            )
+
             r = requests.post(
                 API_URL,
                 json=payload,
@@ -183,11 +252,15 @@ def main():
                 verify=False
             )
 
-            with open("/var/ossec/logs/integrations.log", "a") as log:
-                log.write(f"Sent alert. Response: {r.status_code}\n")
+            if r.status_code == 200:
+                write_log("[custom-soc] HTTP 200 OK")
+            else:
+                write_log(f"[custom-soc] HTTP {r.status_code}")
+                write_log(f"[custom-soc] {r.text}")
+
         except Exception as e:
-            with open("/var/ossec/logs/integrations.log", "a") as log:
-                log.write(f"Error sending custom-soc alert: {e}\n")
+            write_log(f"[custom-soc] ERROR: {e}")
+
 
 if __name__ == "__main__":
     main()

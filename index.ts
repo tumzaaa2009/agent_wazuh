@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update ข้อมูล cdb list แยก hash ip domain fixbug checkrule testจ้าาาา firewall updat bootsssgggg ////
+//ปวดกระบาล V789////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -70,6 +70,18 @@ if (!existsSync(logDir)) {
   import("fs").then(fs => fs.mkdirSync(logDir, { recursive: true })).catch(() => { });
 }
 
+const LOG_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per log file
+
+async function rotateIfNeeded(filepath: string) {
+  try {
+    const file = Bun.file(filepath);
+    if (await file.exists() && file.size > LOG_MAX_BYTES) {
+      const backupPath = filepath.replace('.log', '.old.log');
+      await $`mv -f ${filepath} ${backupPath}`.quiet();
+    }
+  } catch { }
+}
+
 async function writeLog(level: "INFO" | "ERROR", ...args: any[]) {
   const msg = args.map(a => (typeof a === 'object' && a !== null) ? JSON.stringify(a) : String(a)).join(" ");
   const timestamp = new Date().toISOString();
@@ -93,7 +105,9 @@ async function writeLog(level: "INFO" | "ERROR", ...args: any[]) {
     system = "active-response";
   }
 
-  await appendFile(`${logDir}/${system}.log`, logStr).catch(() => { });
+  const logPath = `${logDir}/${system}.log`;
+  await rotateIfNeeded(logPath);
+  await appendFile(logPath, logStr).catch(() => { });
 }
 
 console.log = (...args) => { writeLog("INFO", ...args); };
@@ -145,6 +159,28 @@ async function reportMalwareEvent(eventData: {
   }
 }
 
+// ---------------------------------------------------------
+// IP Validation helper to prevent catastrophic blocks
+// ---------------------------------------------------------
+function isSafeToBlock(ip: string): boolean {
+  if (!ip || typeof ip !== "string") return false;
+  const tIp = ip.trim();
+
+  // Protect localhost
+  if (tIp === "127.0.0.1" || tIp === "::1" || tIp === "0.0.0.0" || tIp === "0.0.0.0/0") return false;
+
+  // Auto-detect: protect this machine's own IPs
+  const nets = os.networkInterfaces();
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] || []) {
+      if (net.address === tIp) return false;
+    }
+  }
+
+  const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
+  return ipv4Regex.test(tIp);
+}
+
 async function processQueueItem(item: any, ws?: WebSocket) {
   const { id: log_id, command, srcip, timeout, agent_id, agent_name } = item;
 
@@ -159,61 +195,133 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
   if (command === "soc-firewall-drop" || command === "firewall-drop") {
     if (srcip && agent_id) {
+      if (!isSafeToBlock(srcip)) {
+        console.error(`⚠️ BLOCKED ACTION: Attempted to drop invalid/unsafe IP: ${srcip}. Ignored.`);
+
+        // Send ACK back so SOC knows it was rejected
+        if (ws) {
+          const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "rejected", reason: "Unsafe IP", log_id };
+          ws.send(JSON.stringify(ackMsg));
+        }
+        fetch(`${API_BASE_URL}/active-response/success`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE, status: "rejected_unsafe_ip" })
+        }).catch(err => console.error("Failed to send reject ACK:", err));
+
+        return;
+      }
+
       const dropMsg = `🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`;
       console.log(dropMsg);
       // ส่งเข้า syslog
       await $`logger -t HOS-Edge-Connector ${dropMsg}`.catch((err: any) => console.error("Syslog error:", err));
 
       try {
-        if (agent_id === "000") {
-          // 1. Local Agent (000): Execute the Active Response binary directly with JSON payload
-          let executable = "/var/ossec/active-response/bin/firewall-drop";
-          if (existsSync("/var/ossec/active-response/bin/firewalld-drop")) {
-             executable = "/var/ossec/active-response/bin/firewalld-drop";
-          }
-          
-          const arPayload = JSON.stringify({
-            version: 1,
-            origin: { name: "edge-connector", module: "active-response" },
-            command: "add",
-            parameters: {
-              extra_args: [],
-              alert: { data: { srcip: srcip } },
-              program: executable.replace("/var/ossec/", "")
-            }
-          });
+        // Detect OS dynamically
+        let isWindows = false;
+        let isUbuntu = false;
+        let isCentosAlma = false;
 
-          console.log(`🚀 Executing local AR: ${executable} with payload: ${arPayload}`);
-          
+        if (agent_id === "000") {
           try {
-            const child = Bun.spawn([executable], { stdin: "pipe" });
-            child.stdin.write(arPayload);
+            const osRelease = await Bun.file('/etc/os-release').text();
+            const osLower = osRelease.toLowerCase();
+            if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
+            else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
+          } catch (e) { }
+        } else {
+          try {
+            const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
+            const osLine = infoOutput.split('\n').find((l: string) => l.toLowerCase().includes('operating system:'));
+            if (osLine) {
+              const osLower = osLine.toLowerCase();
+              if (osLower.includes('windows')) isWindows = true;
+              else if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
+              else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
+            }
+          } catch (e) { }
+        }
+
+        if (agent_id === "000") {
+          // 1. Local Manager (Agent 000)
+          let arScript = '/var/ossec/active-response/bin/firewall-drop';
+          if (isUbuntu) arScript = '/var/ossec/active-response/bin/firewall-drop';
+          else if (isCentosAlma) arScript = '/var/ossec/active-response/bin/firewalld-drop';
+
+          try {
+            console.log(`🚀 Executing local ${arScript} to block ${srcip}`);
+            const child = Bun.spawn([arScript], {
+              stdin: 'pipe',
+              stdout: 'pipe',
+              stderr: 'pipe'
+            });
+
+            // Write initial ADD message
+            const addMsg = JSON.stringify({
+              command: "add",
+              parameters: {
+                extra_args: [],
+                alert: { data: { srcip: srcip } },
+                program: "active-response/bin/firewall-drop"
+              }
+            });
+            child.stdin.write(addMsg + "\n");
             child.stdin.flush();
-            child.stdin.end();
+
+            // We need to read stdout to consume the continue request
+            (async () => {
+              try {
+                const reader = child.stdout.getReader();
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  const output = new TextDecoder().decode(value);
+                  if (output.includes('"command":"continue"')) {
+                    const continueMsg = JSON.stringify({
+                      command: "continue",
+                      parameters: { keys: [srcip] }
+                    });
+                    child.stdin.write(continueMsg + "\n");
+                    child.stdin.flush();
+                    child.stdin.end();
+                    break;
+                  }
+                }
+              } catch (e) {
+                console.error("Error reading AR stdout:", e);
+              }
+            })();
+
             await child.exited;
             console.log(`✅ Successfully executed local block for ${srcip}`);
           } catch (spawnErr) {
             console.error(`❌ Failed to spawn local AR script:`, spawnErr);
           }
         } else {
-          // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
-          // Detect agent OS first
-          const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
-          const isWindows = infoOutput.toLowerCase().includes('windows');
-
-          const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-
-          let arName = 'firewalld-drop';
-          if (isWindows) {
-            const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
-            arName = match ? match[1] : 'netsh';
-          } else {
-            const match = arOutput.match(/Response name: ((?:firewalld?-drop|host-deny)\d*)/);
-            arName = match ? match[1] : 'firewalld-drop';
+          // 2. Remote Agent (Agent 001+)
+          let arName = 'firewall-drop';
+          try {
+            const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
+            if (isWindows) {
+              const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
+              arName = match ? match[1] : 'netsh';
+            } else if (isCentosAlma) {
+              const match = arOutput.match(/Response name: (firewalld?-drop\d*)/);
+              arName = match ? match[1] : 'firewalld-drop';
+            } else {
+              const match = arOutput.match(/Response name: (firewall-drop\d*|host-deny\d*)/);
+              arName = match ? match[1] : 'firewall-drop';
+            }
+          } catch (e) {
+            if (isWindows) arName = 'netsh';
+            else if (isCentosAlma) arName = 'firewalld-drop';
+            else arName = 'firewall-drop';
           }
 
+          console.log(`🚀 Triggering ${arName} on remote agent ${agent_id} (${isWindows ? 'Windows' : (isUbuntu ? 'Ubuntu' : 'CentOS/Linux')}) to block ${srcip}`);
           await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
+          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id}`);
         }
       } catch (err) {
         console.error(`❌ Failed to trigger active response via agent_control:`, err);
@@ -372,7 +480,7 @@ function connect() {
         console.log("🔄 Deleting agent_version.txt to force edge-updater to pull new version...");
         try {
           if (existsSync(`${import.meta.dir}/agent_version.txt`)) {
-              await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
+            await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
           }
         } catch (e) {
           console.error("❌ Failed to delete agent_version.txt:", e);
@@ -410,7 +518,7 @@ function connect() {
 // HTTP Polling Flow (Pull-based API) - Optional
 // ---------------------------------------------------------
 async function pollApiQueue() {
-  const API_QUEUE_URL = process.env.API_QUEUE_URL || "https://rh4cloudcenter.moph.go.th/api/v1/active-response/queues";
+  const API_QUEUE_URL = process.env.API_QUEUE_URL || `${WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "")}/api/v1/active-response/queues`;
 
   try {
     const response = await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}`, {
@@ -420,8 +528,8 @@ async function pollApiQueue() {
 
     if (response.ok) {
       const data = await response.json();
-      if (Array.isArray(data) && data[0]?.success && data[0]?.queues) {
-        const queues = data[0].queues;
+      if (data && data.success && Array.isArray(data.queues)) {
+        const queues = data.queues;
         if (queues.length > 0) {
           console.log(`🔄 Polled ${queues.length} items from API`);
           for (const item of queues) {
@@ -434,6 +542,12 @@ async function pollApiQueue() {
             });
             console.log(`🗑️ Cleared queue for ${item.srcip}`);
           }
+          
+          // If there are more items in the queue, fetch the next batch quickly
+          if (data.total_queued && data.total_queued > queues.length) {
+             console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
+             setTimeout(pollApiQueue, 2000);
+          }
         }
       }
     }
@@ -442,520 +556,10 @@ async function pollApiQueue() {
   }
 }
 
-// ---------------------------------------------------------
-// YARA Rules Synchronization (Pull-based)
-// ---------------------------------------------------------
-async function fetchYaraRules() {
-  try {
-    console.log(`📥 Checking YARA rules version at ${YARA_API_URL}/version...`);
 
-    const RULES_PATH = "/var/ossec/etc/shared/default/yara_rules.yar";
-
-    // Version check to avoid redundant downloads (bandwidth optimization)
-    try {
-      const versionRes = await fetch(`${YARA_API_URL}/version`, { signal: AbortSignal.timeout(5000) });
-      if (versionRes.ok) {
-        const vData = await versionRes.json();
-        const versionFile = '/app/yara_rules_version.txt';
-        const fileExists = await Bun.file(versionFile).exists();
-        if (fileExists) {
-          const localVersion = (await Bun.file(versionFile).text()).trim();
-          if (localVersion === String(vData.version)) {
-            console.log(`✅ YARA Rules already up to date (version: ${vData.version}). Skipping download.`);
-            return;
-          }
-        }
-        // Will save version after successful download below
-        console.log(`📥 YARA Rules update available (remote: ${vData.version}). Downloading...`);
-        const response = await fetch(YARA_API_URL);
-        if (response.ok) {
-          const data = await response.json();
-          if (data.success && data.rules) {
-            let combinedRules = "";
-            for (const rule of data.rules) {
-              const decodedContent = Buffer.from(rule.content, 'base64').toString('utf-8');
-              combinedRules += decodedContent + "\n";
-            }
-            await Bun.write(RULES_PATH, combinedRules);
-            await $`chown wazuh:wazuh ${RULES_PATH} && chmod 660 ${RULES_PATH}`.catch(() => { });
-            await Bun.write(versionFile, String(vData.version));
-            console.log(`✅ Successfully updated YARA rules at ${RULES_PATH} (version: ${vData.version})`);
-          }
-        } else {
-          console.error(`❌ Failed to fetch YARA rules: ${response.statusText}`);
-        }
-        return; // Done via version-check path
-      }
-    } catch {
-      // Version endpoint not available — fall through to full download
-      console.log(`⚠️ YARA version API not available. Falling back to full download...`);
-    }
-
-    // Fallback: full download without version check
-    console.log(`📥 Fetching latest YARA rules from ${YARA_API_URL}...`);
-    const response = await fetch(YARA_API_URL);
-    if (response.ok) {
-      const data = await response.json();
-      if (data.success && data.rules) {
-        let combinedRules = "";
-        for (const rule of data.rules) {
-          const decodedContent = Buffer.from(rule.content, 'base64').toString('utf-8');
-          combinedRules += decodedContent + "\n";
-        }
-        await Bun.write(RULES_PATH, combinedRules);
-        await $`chown wazuh:wazuh ${RULES_PATH} && chmod 660 ${RULES_PATH}`.catch(() => { });
-        console.log(`✅ Successfully updated YARA rules at ${RULES_PATH}`);
-      }
-    } else {
-      console.error(`❌ Failed to fetch YARA rules: ${response.statusText}`);
-    }
-  } catch (err) {
-    console.error(`❌ Error fetching YARA rules:`, err);
-  }
-}
-
-// ---------------------------------------------------------
-// SOC Rule Policy Synchronization (New Queue System)
-// ---------------------------------------------------------
-async function syncRulePolicy() {
-  const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
-  const VERSION_FILE = `${import.meta.dir}/soc_rules_version.txt`;
-  try {
-    console.log(`📥 Querying SOC for latest policy queues...`);
-    const res = await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
-    if (!res.ok) return;
-    const data = await res.json();
-    const updates = data.queues;
-
-    if (updates && updates.length > 0) {
-      const latestUpdate = updates[0];
-      const expectedTarget = `${latestUpdate.version_hash} used`;
-
-      let currentTopLine = '';
-      if (existsSync(VERSION_FILE)) {
-        const content = await Bun.file(VERSION_FILE).text();
-        const lines = content.split('\n').filter(l => l.trim().length > 0);
-        currentTopLine = lines.length > 0 ? lines[0].trim() : '';
-      }
-
-      if (currentTopLine !== expectedTarget) {
-        console.log(`🔍 Checking queued updates... Found patch version: ${latestUpdate.version_hash}`);
-        console.log(`[SYNC] Version mismatch detected. Local: '${currentTopLine}', Remote: '${expectedTarget}'. Updating...`);
-        console.log(`📥 Downloading configuration payload for patch: ${latestUpdate.version_hash}...`);
-
-        let configUrl = `${CENTRAL_API}/api/v1/rules/configs`;
-        if (latestUpdate.action === 'rollback') {
-          configUrl = `${CENTRAL_API}/api/v1/rules/backup/${latestUpdate.version_hash}`;
-        }
-
-        const configRes = await fetch(configUrl);
-        if (configRes.ok) {
-          const configData = await configRes.json();
-          const { agent_xml, manager_xml, wazuh_files } = configData;
-
-          await Bun.write('/var/ossec/etc/shared/default/agent_mockup.xml', agent_xml);
-          await Bun.write('/var/ossec/etc/manager_mockup.xml', manager_xml);
-
-          if (wazuh_files && Array.isArray(wazuh_files)) {
-            for (const file of wazuh_files) {
-              if (file.type === 'rule') {
-                const p = `/var/ossec/etc/rules/${file.filename}`;
-                await Bun.write(p, file.content);
-                await $`chown root:wazuh ${p} && chmod 660 ${p}`.catch(() => { });
-              } else if (file.type === 'decoder') {
-                const p = `/var/ossec/etc/decoders/${file.filename}`;
-                await Bun.write(p, file.content);
-                await $`chown root:wazuh ${p} && chmod 660 ${p}`.catch(() => { });
-              }
-            }
-          }
-
-          // Auto inject configurations into ossec.conf and agent.conf
-          // Note: autoInjectWazuhConfigs expects base64 encoded strings
-          await autoInjectWazuhConfigs({
-            mockup_agent: agent_xml ? Buffer.from(agent_xml).toString('base64') : null,
-            mockup_manager: manager_xml ? Buffer.from(manager_xml).toString('base64') : null
-          });
-
-          await Bun.write(VERSION_FILE, expectedTarget + '\n');
-          console.log(`[SYNC] Rules applied successfully for ${latestUpdate.version_hash}`);
-
-          // Restart Wazuh Manager
-          await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager`.catch(() => { });
-        }
-      } else {
-        console.log(`[SYNC] Edge is already up to date with ${expectedTarget}.`);
-      }
-
-      await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`, {
-        method: "DELETE"
-      });
-    }
-  } catch (err: any) {
-    console.error(`[SYNC ERROR]: ${err.message}`);
-  }
-}
-
-// ---------------------------------------------------------
-// SOC Wazuh Rules & Decoders Synchronization
-// ---------------------------------------------------------
-
-async function autoInjectWazuhConfigs(data: any) {
-  if (!data.mockup_agent && !data.mockup_manager) return;
-
-  const ossecConfPath = '/var/ossec/etc/ossec.conf';
-  const agentConfPath = '/var/ossec/etc/shared/default/agent.conf';
-
-  try {
-    let confContent = await Bun.file(ossecConfPath).text();
-    let agentConfContent = await Bun.file(agentConfPath).text();
-    let needsRestart = false;
-
-    // In API v1/v2, data.mockup_agent is the FULL yara_deployment/agent.conf file.
-    // data.mockup_manager is the FULL manager_mockup.xml file.
-    let managerMockup = "";
-    let agentMockup = "";
-
-    if (data.mockup_agent) {
-      agentMockup = Buffer.from(data.mockup_agent, 'base64').toString('utf-8');
-    }
-
-    if (data.mockup_manager) {
-      managerMockup = Buffer.from(data.mockup_manager, 'base64').toString('utf-8');
-    }
-
-    // 1. Update Manager Config (ossec.conf) — remove old block, inject new
-    if (managerMockup) {
-      const START = '<!-- INJECTED BY EDGE CONNECTOR';
-
-      // Clean up the incoming payload so it strictly starts at the INJECTED tag
-      const mockupStartIdx = managerMockup.indexOf(START);
-      if (mockupStartIdx !== -1) {
-        managerMockup = managerMockup.substring(mockupStartIdx);
-      }
-
-      const END = '<!-- USER CUSTOM CONFIGURATION BLOCK ENDS HERE   -->';
-      let startIdx = confContent.indexOf(START);
-      let endIdx = confContent.indexOf(END);
-
-      // Remove ALL existing injected blocks (if any duplicates exist due to old bugs)
-      while (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-        // Find if there are stray "<!-- ========================================== -->" and newlines right above startIdx
-        let realStartIdx = startIdx;
-        const precedingText = confContent.substring(0, startIdx);
-        const match = precedingText.match(/(?:<!-- ========================================== -->\s*)+$/);
-        if (match) {
-          realStartIdx -= match[0].length;
-        }
-
-        confContent = confContent.substring(0, realStartIdx) + confContent.substring(endIdx + END.length);
-        startIdx = confContent.indexOf(START);
-        endIdx = confContent.indexOf(END);
-      }
-
-      // Inject new block right before </ossec_config>
-      confContent = confContent.replace('</ossec_config>', `\n${managerMockup}\n</ossec_config>`);
-
-      await Bun.write(ossecConfPath, confContent);
-      await $`chown root:wazuh ${ossecConfPath} && chmod 660 ${ossecConfPath}`;
-      needsRestart = true;
-      console.log("✅ Manager mockup updated in ossec.conf.");
-    }
-
-    // 2. Inject Agent Config (agent.conf)
-    if (agentMockup) {
-      console.log("⚙️ Overwriting agent.conf with central SOC mockup...");
-      await Bun.write(agentConfPath, agentMockup);
-      await $`chown wazuh:wazuh ${agentConfPath} && chmod 660 ${agentConfPath}`;
-      needsRestart = true;
-      console.log("✅ Agent config synchronized.");
-    }
-
-  } catch (err) {
-    console.error("❌ Error injecting mockups:", err);
-  }
-}
-
-async function fetchSocConfigs() {
-  const SOC_CONFIG_URL = process.env.SOC_CONFIG_URL || "https://rh4cloudcenter.moph.go.th/api/v1/wazuh-configs";
-  try {
-    console.log(`📥 Checking for SOC configs updates at ${SOC_CONFIG_URL}/version...`);
-    const versionRes = await fetch(`${SOC_CONFIG_URL}/version`);
-    if (versionRes.ok) {
-      const vData = await versionRes.json();
-      if (vData.success && vData.version) {
-        const currentDir = import.meta.dir;
-        const versionFile = `${currentDir}/soc_rules_version.txt`;
-        const fileExists = await Bun.file(versionFile).exists();
-        if (fileExists) {
-          const content = await Bun.file(versionFile).text();
-          const localVersion = content.split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
-          const remoteVersion = String(vData.version).split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
-          if (localVersion === remoteVersion || localVersion === `${remoteVersion} used`) {
-            console.log("✅ SOC Configs are already up to date. Skipping download.");
-            return;
-          }
-        }
-
-        console.log(`📥 Updates found! Fetching latest SOC configs from ${SOC_CONFIG_URL}...`);
-        const response = await fetch(SOC_CONFIG_URL);
-        if (response.ok) {
-          const data = await response.json();
-          if (data.success) {
-            console.log("📦 Extracting SOC configs to /var/ossec/etc/...");
-
-            // Write rules
-            if (data.rules) {
-              for (const rule of data.rules) {
-                const filepath = `/var/ossec/etc/rules/${rule.filename}`;
-                const decodedContent = Buffer.from(rule.content, 'base64').toString('utf-8');
-                await Bun.write(filepath, decodedContent);
-                await $`chmod 640 ${filepath}`.catch(() => { });
-                await $`chown root:wazuh ${filepath}`.catch((e) => {
-                  console.log(`⚠️ Note: Could not set root:wazuh on ${filepath}`);
-                });
-              }
-            }
-
-            // Write decoders
-            if (data.decoders) {
-              for (const decoder of data.decoders) {
-                const filepath = `/var/ossec/etc/decoders/${decoder.filename}`;
-                const decodedContent = Buffer.from(decoder.content, 'base64').toString('utf-8');
-                await Bun.write(filepath, decodedContent);
-                await $`chown root:wazuh ${filepath} && chmod 750 ${filepath}`;
-              }
-            }
-
-            // Save the new version
-            const remoteVersion = String(vData.version).split('\n').filter(l => l.trim().length > 0)[0]?.trim() || "";
-            await Bun.write(versionFile, remoteVersion + " used\n");
-            // Permissions for version file might not be strictly needed since it's in our dir, but just in case
-            await $`chmod 640 ${versionFile}`.catch(() => { });
-
-            // Auto inject configurations
-            await autoInjectWazuhConfigs(data);
-
-            console.log("🔄 Restarting Wazuh Manager to apply new configs...");
-            await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager`;
-            console.log("✅ Wazuh configs synced successfully!");
-          }
-        } else {
-          console.error(`❌ Failed to fetch SOC configs: ${response.statusText}`);
-        }
-      }
-    } else {
-      console.error(`❌ Failed to fetch config version: ${versionRes.statusText}`);
-    }
-  } catch (err) {
-    console.error(`❌ Error fetching SOC configs:`, err);
-  }
-}
-
-// ---------------------------------------------------------
-// Automated YARA WPK Deployment Orchestrator
-// ---------------------------------------------------------
-async function deployYaraWpk() {
-  // Deprecated: YARA deployment is now handled natively via Docker and agent.conf
-}
-
-// ---------------------------------------------------------
-// Self-Updater is now handled by edge-updater container
-// ---------------------------------------------------------
-
-// ---------------------------------------------------------
-// Custom SOC Updater Mechanism
-// ---------------------------------------------------------
-async function checkCustomSocUpdate() {
-  const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
-  const currentDir = import.meta.dir;
-  const versionFile = `${currentDir}/version_custom_soc.txt`;
-  const scriptFile = `${currentDir}/custom-soc`;
-  const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
-
-  try {
-    let localVersion = "";
-    if (existsSync(versionFile)) {
-      localVersion = (await Bun.file(versionFile).text()).trim();
-    } else {
-      await Bun.write(versionFile, "");
-    }
-
-    // 1. Ensure local script is copied to Wazuh if it's missing in Wazuh but exists locally
-    if (!existsSync(wazuhIntegrationPath) && existsSync(scriptFile)) {
-      console.log(`📥 Restoring missing custom-soc to Wazuh from local backup...`);
-      const scriptText = await Bun.file(scriptFile).text();
-      await Bun.write(wazuhIntegrationPath, scriptText);
-      await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => { });
-      await $`chown root:wazuh ${wazuhIntegrationPath}`.catch(() => { });
-      console.log(`✅ Successfully restored custom-soc to ${wazuhIntegrationPath}.`);
-    }
-
-    // 2. Check for updates from Central API
-    console.log(`📥 Querying API for latest Custom SOC patches...`);
-    const res = await fetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
-    if (res.ok) {
-      const data = await res.json();
-
-      if (data.success && data.version && data.version !== localVersion) {
-        console.log(`🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}.`);
-        console.log(`📥 Downloading new custom-soc script...`);
-        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
-        if (scriptRes.ok) {
-          const scriptText = await scriptRes.text();
-
-          // Save locally
-          await Bun.write(scriptFile, scriptText);
-          await Bun.write(versionFile, data.version);
-          await $`chmod +x ${scriptFile}`.catch(() => { });
-
-          // Deploy to Wazuh
-          await Bun.write(wazuhIntegrationPath, scriptText);
-          await $`chmod 750 ${wazuhIntegrationPath}`.catch(() => { });
-          await $`chown root:wazuh ${wazuhIntegrationPath}`.catch((e) => {
-            console.log(`⚠️ Note: Could not set root:wazuh ownership on ${wazuhIntegrationPath}`);
-          });
-
-          console.log(`✅ [UPDATE] Successfully overwrote local custom-soc and deployed to ${wazuhIntegrationPath}.`);
-        }
-      }
-    }
-  } catch (err) {
-    console.error("❌ Failed to check for Custom SOC updates:", err);
-  }
-}
-
-async function checkMispUpdates() {
-  try {
-    console.log(`📥 Checking for MISP updates at /api/v1/threat-intel/misp-version...`);
-    const res = await fetch(`${BASE_API_URL}/api/v1/threat-intel/misp-version`, {
-      headers: { "Authorization": `Bearer ${API_KEY}` }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.success && data.version) {
-        const currentDir = import.meta.dir;
-        const versionFile = `${currentDir}/version_misp_ioc.txt`;
-        const fileExists = await Bun.file(versionFile).exists();
-        if (fileExists) {
-          const localVersion = (await Bun.file(versionFile).text()).trim();
-          if (localVersion === data.version) {
-            return;
-          }
-        }
-
-        console.log(`📥 MISP IOC updates found (${data.version})!`);
-        await downloadMispCdb();
-        await Bun.write(versionFile, data.version);
-
-        console.log("🔄 Restarting wazuh-manager to apply new MISP DB...");
-        exec("systemctl restart wazuh-manager.service", (err) => {
-          if (err) console.error("❌ Failed to restart wazuh-manager:", err.message);
-          else console.log("✅ Successfully restarted wazuh-manager.");
-        });
-      }
-    }
-  } catch (err) {
-    console.error("❌ Failed to check for MISP updates:", err);
-  }
-}
-
-async function downloadMispCdb() {
-  console.log("📥 Downloading MISP CDB lists from Central SOC...");
-  try {
-    const listDir = "/var/ossec/etc/lists";
-    if (!existsSync(listDir)) {
-      exec(`mkdir -p ${listDir}`);
-    }
-
-    const types = [
-      { url: 'misp-ip.txt', file: 'misp_ip' },
-      { url: 'misp-domain.txt', file: 'misp_domain' },
-      { url: 'misp-hash.txt', file: 'misp_hash' }
-    ];
-
-    let downloadedCount = 0;
-
-    for (const { url, file } of types) {
-      const res = await fetch(`${BASE_API_URL}/api/v1/threat-intel/${url}`, {
-        headers: { "Authorization": `Bearer ${API_KEY}` }
-      });
-      if (res.ok) {
-        const text = await res.text();
-        await Bun.write(`/var/ossec/etc/lists/${file}`, text);
-        console.log(`✅ Saved ${file} to /var/ossec/etc/lists/`);
-        downloadedCount++;
-      } else if (res.status === 404) {
-        console.log(`ℹ️ No MISP CDB list found for ${file} on Central SOC yet.`);
-      } else {
-        console.error(`❌ Failed to download ${file}. Status: ${res.status}`);
-      }
-    }
-
-    if (downloadedCount > 0) {
-      console.log("✅ Successfully downloaded MISP CDB lists. Awaiting wazuh restart to apply.");
-    }
-  } catch (e: any) {
-    console.error("❌ Error downloading MISP CDBs:", e.message);
-  }
-}
-
-// Start WebSocket connection
-connect();
-
-// ---------------------------------------------------------
-// Policy Sync (API v2)
-// ---------------------------------------------------------
-async function fetchPoliciesV2() {
-  const API_BASE_V2 = process.env.API_URL_V2 || "https://rh4cloudcenter.moph.go.th/api/v2";
-  try {
-    const response = await fetch(`${API_BASE_V2}/policies/${HOSPITAL_CODE}`, {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${API_KEY}` }
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (data.success && data.policy) {
-        await Bun.write('/var/ossec/etc/runtime_policy.json', JSON.stringify(data.policy, null, 2));
-        console.log(`✅ OpenXDR Phase 1: Fetched and saved runtime_policy.json (v${data.policy.version})`);
-      }
-    }
-  } catch (err) {
-    console.error("❌ API v2 Policy Fetch Error:", err);
-  }
-}
-
-// Initial fetch and set interval for Policy updates (5 mins)
-fetchPoliciesV2();
-setInterval(fetchPoliciesV2, 5 * 60 * 1000);
-
-// Initial fetch and set interval for daily YARA updates (24h)
-fetchYaraRules();
-setInterval(fetchYaraRules, 24 * 60 * 60 * 1000);
-
-// Initial fetch and set interval for daily SOC Configs updates (24h)
-fetchSocConfigs();
-setInterval(fetchSocConfigs, 24 * 60 * 60 * 1000);
-
-// Run Rule Policy Sync periodically (every 1 min)
-syncRulePolicy();
-setInterval(syncRulePolicy, 60000);
-
-// Run WPK Deployment Orchestrator periodically (every 5 mins)
-deployYaraWpk();
-setInterval(deployYaraWpk, 5 * 60 * 1000);
-
-// Run Custom SOC Updater periodically (every 5 mins)
-checkCustomSocUpdate();
-setInterval(checkCustomSocUpdate, 5 * 60 * 1000);
-
-// Run MISP updates periodically (every 1 min)
-checkMispUpdates();
-setInterval(checkMispUpdates, 60000);
-
-// Uncomment to enable HTTP API Polling every 10 seconds
-setInterval(pollApiQueue, 10000);
+// HTTP API Polling fallback (every 30 seconds — WebSocket is primary)
+pollApiQueue(); // Call immediately on startup
+setInterval(pollApiQueue, 30 * 1000);
 
 
 
