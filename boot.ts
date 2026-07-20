@@ -96,11 +96,11 @@ async function checkCustomSocUpdate() {
                 if (installRequired) {
                     console.log("[BOOT] 📥 Installing custom-soc...");
 
-                    await $`install -o root -g wazuh -m 750 ${scriptFileSOC} ${wazuhIntegrationPath}`;
+                    await $`install -o root -m 750 ${scriptFileSOC} ${wazuhIntegrationPath}`;
 
                     console.log("[BOOT] ✅ custom-soc installed.");
                 } else {
-                    await $`chown root:wazuh ${wazuhIntegrationPath}`;
+                    await $`chown root:110 ${wazuhIntegrationPath}`;
                     await $`chmod 750 ${wazuhIntegrationPath}`;
                 }
 
@@ -143,11 +143,11 @@ async function checkCustomSocUpdate() {
             await Bun.write(scriptFileSOC, scriptText);
             await Bun.write(versionFileSOC, `${data.version} used\n`);
 
-            await $`chown root:wazuh ${scriptFileSOC}`;
+            await $`chown root:110 ${scriptFileSOC}`;
             await $`chmod 750 ${scriptFileSOC}`;
 
             // install to Wazuh Integration
-            await $`install -o root -g wazuh -m 750 ${scriptFileSOC} ${wazuhIntegrationPath}`;
+            await $`install -o root -m 750 ${scriptFileSOC} ${wazuhIntegrationPath}`;
 
             await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager || /var/ossec/bin/wazuh-control restart`;
 
@@ -289,7 +289,7 @@ async function autoInjectWazuhConfigs(data: any) {
         if (managerMockup) {
             console.log("⚙️ Overwriting ossec.conf with central SOC mockup...");
             await Bun.write(ossecConfPath, managerMockup);
-            await $`chown root:wazuh ${ossecConfPath} && chmod 660 ${ossecConfPath}`.quiet().catch(() => { });
+            await $`chown root:110 ${ossecConfPath} && chmod 660 ${ossecConfPath}`.quiet().catch(() => { });
         }
 
         if (agentMockup) {
