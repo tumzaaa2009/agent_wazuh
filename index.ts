@@ -31,7 +31,7 @@ function setupDummyLists() {
   if (platform === 'linux') {
     // Wazuh dashboard API crashes with 500 if these files are missing
     // Files MUST have at least one valid key:value pair, otherwise wazuh-analysisd fails to load them
-    exec('mkdir -p /var/ossec/etc/lists/malicious-ioc && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-ip && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-domains && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malware-hashes && chown -R wazuh:wazuh /var/ossec/etc/lists/malicious-ioc', (err) => {
+    exec('mkdir -p /var/ossec/etc/lists/malicious-ioc && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-ip && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-domains && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malware-hashes && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_c2_servers && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_virus_sigs && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_compromised && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_malicious_urls && chown -R wazuh:wazuh /var/ossec/etc/lists/malicious-ioc /var/ossec/etc/lists/queue_*', (err) => {
       if (err) console.log("⚠️ Failed to setup dummy lists:", err.message);
       else console.log("✅ Successfully verified legacy lists exist.");
     });
