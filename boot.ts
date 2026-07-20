@@ -1,11 +1,8 @@
-import { spawn, exec, execFile } from "child_process";
-import { promisify } from "util";
+import { spawn, exec } from "child_process";
 import { existsSync } from "fs";
 import { readFile, writeFile, appendFile } from "fs/promises";
 import * as path from "path";
 import { $ } from "bun";
-
-const execFileAsync = promisify(execFile);
 
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
 const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
@@ -17,74 +14,12 @@ const SOC_CONFIG_URL = process.env.SOC_CONFIG_URL || "https://rh4cloudcenter.mop
 const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const API_KEY = process.env.API_KEY || "";
 
-// The updater runs inside a container whose own /etc/passwd does NOT have the
-// "wazuh" user/group, even though /var/ossec is bind-mounted from the host where it does.
-// chown/chmod by NAME fails inside the container because name resolution happens in the
-// container's own nsswitch, not the host's. Numeric uid:gid works regardless of names,
-// BUT the actual uid/gid differ across distros (Ubuntu vs AlmaLinux install wazuh with
-// different ids), so we can't hardcode a single number — we detect it at runtime by
-// stat-ing a path Wazuh itself already owns (works no matter what distro is underneath).
-// Env override (WAZUH_UID / WAZUH_GID) always wins if set.
-let WAZUH_UID = process.env.WAZUH_UID || "";
-let WAZUH_GID = process.env.WAZUH_GID || "";
-const ROOT_UID = process.env.ROOT_UID || "0";
-const IS_LINUX = process.platform === "linux";
-
-async function detectWazuhIds() {
-    if (!IS_LINUX) {
-        console.log(`[PERM] ℹ️ Platform is '${process.platform}', not Linux — skipping unix chown/chmod entirely.`);
-        return;
-    }
-    if (WAZUH_UID && WAZUH_GID) {
-        console.log(`[PERM] ℹ️ Using WAZUH_UID/WAZUH_GID from env: ${WAZUH_UID}:${WAZUH_GID}`);
-        return;
-    }
-    // Any of these should already be owned by the wazuh user after a normal install,
-    // regardless of distro (Ubuntu/Debian, AlmaLinux/RHEL, etc.)
-    const probePaths = ["/var/ossec/logs", "/var/ossec/queue", "/var/ossec/var/run", "/var/ossec/etc/shared"];
-    for (const p of probePaths) {
-        try {
-            const { stdout } = await execFileAsync("stat", ["-c", "%u:%g", p]);
-            const [uid, gid] = stdout.trim().split(":");
-            if (uid && gid && uid !== "0") {
-                WAZUH_UID = uid;
-                WAZUH_GID = gid;
-                console.log(`[PERM] ✅ Detected wazuh uid:gid = ${uid}:${gid} (from ${p})`);
-                return;
-            }
-        } catch { /* try next path */ }
-    }
-    console.error(`[PERM] ❌ Could not auto-detect wazuh uid/gid on this host (tried: ${probePaths.join(", ")}). Set WAZUH_UID/WAZUH_GID env vars manually.`);
-}
-
 const currentDir = import.meta.dir;
 const dataDir = currentDir === '/app' ? currentDir : path.join(currentDir, "..");
 const versionFile = path.join(dataDir, 'agent_version.txt');
 const scriptFile = path.join(currentDir, 'index.ts');
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-// Applies owner:group + chmod to a path using the REAL system chown/chmod binaries
-// (via execFile, no shell involved) — avoids Bun Shell's built-in chown mis-parsing "user:group".
-// No-ops safely on non-Linux platforms (e.g. Windows agents) since unix ownership doesn't apply there.
-// Always logs the result (success, failure, or skip).
-async function applyPerm(filepath: string, owner: string, mode: string, label: string) {
-    if (!IS_LINUX) {
-        console.log(`[PERM] ⏭️ ${label}: skipped (platform '${process.platform}' has no unix chown/chmod) — ${filepath}`);
-        return;
-    }
-    if (owner.includes("undefined") || owner.startsWith(":") || owner.endsWith(":")) {
-        console.error(`[PERM] ❌ ${label}: skipped — wazuh uid/gid not detected yet, owner was '${owner}' on ${filepath}`);
-        return;
-    }
-    try {
-        await execFileAsync("chown", [owner, filepath]);
-        await execFileAsync("chmod", [mode, filepath]);
-        console.log(`[PERM] ✅ ${label}: ${filepath} -> ${owner} ${mode}`);
-    } catch (e: any) {
-        console.error(`[PERM] ❌ ${label}: FAILED to set ${owner} ${mode} on ${filepath} — ${e.stderr?.toString().trim() || e.message}`);
-    }
-}
 
 async function checkAndApplyUpdate(): Promise<boolean> {
     try {
@@ -127,48 +62,101 @@ async function checkAndApplyUpdate(): Promise<boolean> {
 async function checkCustomSocUpdate() {
     const versionFileSOC = `${dataDir}/version_custom_soc.txt`;
     exec(`mkdir -p /var/hos-edge-connector`);
+
     const scriptFileSOC = `${dataDir}/custom-soc`;
     const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
 
     try {
         let localVersion = "";
+
         if (existsSync(versionFileSOC)) {
             const content = await Bun.file(versionFileSOC).text();
-            localVersion = content.split('\n')[0].trim().replace(" used", "");
+            localVersion = content.split("\n")[0].trim().replace(" used", "");
         } else {
             await Bun.write(versionFileSOC, "");
         }
 
-        if (!existsSync(wazuhIntegrationPath) && existsSync(scriptFileSOC)) {
-            console.log(`[BOOT] 📥 Restoring missing custom-soc to Wazuh from local backup...`);
-            const scriptText = await Bun.file(scriptFileSOC).text();
-            await $`rm -f ${wazuhIntegrationPath}`.quiet().catch((e) => console.error(`[PERM] ❌ rm failed on ${wazuhIntegrationPath}: ${e.stderr?.toString() || e.message}`));
-            await Bun.write(wazuhIntegrationPath, scriptText);
-            await applyPerm(wazuhIntegrationPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "custom-soc restore (integrations)");
+        // ------------------------------------------------------------------
+        // Ensure custom-soc exists with correct owner/permission
+        // ------------------------------------------------------------------
+        if (existsSync(scriptFileSOC)) {
+            try {
+                let installRequired = !existsSync(wazuhIntegrationPath);
+
+                if (!installRequired) {
+                    const source = await Bun.file(scriptFileSOC).text();
+                    const target = await Bun.file(wazuhIntegrationPath).text().catch(() => "");
+
+                    if (source !== target) {
+                        installRequired = true;
+                        console.log("[BOOT] 🔄 custom-soc has changed. Updating...");
+                    }
+                }
+
+                if (installRequired) {
+                    console.log("[BOOT] 📥 Installing custom-soc...");
+
+                    await $`install -o root -g wazuh -m 750 ${scriptFileSOC} ${wazuhIntegrationPath}`;
+
+                    console.log("[BOOT] ✅ custom-soc installed.");
+                } else {
+                    await $`chown root:wazuh ${wazuhIntegrationPath}`;
+                    await $`chmod 750 ${wazuhIntegrationPath}`;
+                }
+
+            } catch (err) {
+                console.error("[BOOT] ❌ Failed to install custom-soc:", err);
+            }
+        } else {
+            console.warn("[BOOT] ⚠️ Local custom-soc not found:", scriptFileSOC);
         }
 
-        console.log(`[BOOT] 📥 Querying API for latest Custom SOC patches...`);
+        // ------------------------------------------------------------------
+        // Check remote version
+        // ------------------------------------------------------------------
+        console.log("[BOOT] 📥 Querying API for latest Custom SOC patches...");
+
         const res = await fetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
-        if (res.ok) {
-            const data = await res.json();
-            if (data.success && data.version && data.version !== localVersion) {
-                console.log(`[BOOT] 🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}.`);
-                const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
-                if (scriptRes.ok) {
-                    const scriptText = await scriptRes.text();
-                    await $`rm -f ${scriptFileSOC}`.quiet().catch((e) => console.error(`[PERM] ❌ rm failed on ${scriptFileSOC}: ${e.stderr?.toString() || e.message}`));
-                    await Bun.write(scriptFileSOC, scriptText);
-                    await Bun.write(versionFileSOC, data.version + " used\n");
-                    await applyPerm(scriptFileSOC, `${ROOT_UID}:${WAZUH_GID}`, "750", "custom-soc backup copy");
-                    await $`rm -f ${wazuhIntegrationPath}`.quiet().catch((e) => console.error(`[PERM] ❌ rm failed on ${wazuhIntegrationPath}: ${e.stderr?.toString() || e.message}`));
-                    await Bun.write(wazuhIntegrationPath, scriptText);
-                    await applyPerm(wazuhIntegrationPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "custom-soc remote update (integrations)");
-                    await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager || /var/ossec/bin/wazuh-control restart`.quiet().catch(() => { });
-                    console.log(`[BOOT] ✅ Successfully updated custom-soc.`);
-                }
-            }
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+
+        if (
+            data.success &&
+            data.version &&
+            data.version !== localVersion
+        ) {
+            console.log(
+                `[BOOT] 🚀 [UPDATE] Custom SOC Remote=${data.version} Local=${localVersion}`
+            );
+
+            const scriptRes = await fetch(
+                `${CENTRAL_API}/api/v1/custom-soc/script`
+            );
+
+            if (!scriptRes.ok) return;
+
+            const scriptText = await scriptRes.text();
+
+            // backup
+            await Bun.write(scriptFileSOC, scriptText);
+            await Bun.write(versionFileSOC, `${data.version} used\n`);
+
+            await $`chown root:wazuh ${scriptFileSOC}`;
+            await $`chmod 750 ${scriptFileSOC}`;
+
+            // install to Wazuh Integration
+            await $`install -o root -g wazuh -m 750 ${scriptFileSOC} ${wazuhIntegrationPath}`;
+
+            await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager || /var/ossec/bin/wazuh-control restart`;
+
+            console.log("[BOOT] ✅ custom-soc updated.");
         }
-    } catch (err) { }
+
+    } catch (err: any) {
+        console.error("[BOOT] ❌ custom-soc:", err.message);
+    }
 }
 
 async function fetchYaraRules() {
@@ -194,7 +182,7 @@ async function fetchYaraRules() {
                             combinedRules += Buffer.from(rule.content, 'base64').toString('utf-8') + "\n";
                         }
                         await Bun.write(RULES_PATH, combinedRules);
-                        await applyPerm(RULES_PATH, `${WAZUH_UID}:${WAZUH_GID}`, "660", "YARA rules");
+                        await $`chown 115:125 ${RULES_PATH} && chmod 660 ${RULES_PATH}`.quiet().catch(() => { });
                         await Bun.write(versionFile, String(vData.version) + " used\n");
                         console.log(`[BOOT] ✅ Successfully updated YARA rules.`);
                     }
@@ -223,15 +211,14 @@ async function checkMispUpdates() {
                 const types = [
                     { url: 'misp-ip.txt', file: 'misp_ip' },
                     { url: 'misp-domain.txt', file: 'misp_domain' },
-                    { url: 'misp-hash.txt', file: 'misp_hash' }
+                    { url: 'misp-hash.txt', file: 'misp_hash' },
+                    { url: 'misp-hash-sysmon.txt', file: 'misp_hash_sysmon' }
                 ];
                 exec(`mkdir -p /var/ossec/etc/lists`);
                 for (const { url, file } of types) {
                     const r = await fetch(`${BASE_API_URL}/api/v1/threat-intel/${url}`, { headers: { "Authorization": `Bearer ${API_KEY}` } });
                     if (r.ok) {
-                        const filepath = `/var/ossec/etc/lists/${file}`;
-                        await Bun.write(filepath, await r.text());
-                        await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", `MISP list (${file})`);
+                        await Bun.write(`/var/ossec/etc/lists/${file}`, await r.text());
                     }
                 }
                 await Bun.write(versionFile, data.version + " used\n");
@@ -263,14 +250,14 @@ async function fetchSocConfigs() {
                             for (const rule of data.rules) {
                                 const filepath = `/var/ossec/etc/rules/${rule.filename}`;
                                 await Bun.write(filepath, Buffer.from(rule.content, 'base64').toString('utf-8'));
-                                await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", `SOC config rule (${rule.filename})`);
+                                await $`chown 115:125 ${filepath} && chmod 660 ${filepath}`.quiet().catch(() => { });
                             }
                         }
                         if (data.decoders) {
                             for (const decoder of data.decoders) {
                                 const filepath = `/var/ossec/etc/decoders/${decoder.filename}`;
                                 await Bun.write(filepath, Buffer.from(decoder.content, 'base64').toString('utf-8'));
-                                await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", `SOC config decoder (${decoder.filename})`);
+                                await $`chown 115:125 ${filepath} && chmod 660 ${filepath}`.quiet().catch(() => { });
                             }
                         }
                         const remoteVersion = String(vData.version).split('\n')[0]?.trim() || "";
@@ -302,12 +289,12 @@ async function autoInjectWazuhConfigs(data: any) {
         if (managerMockup) {
             console.log("⚙️ Overwriting ossec.conf with central SOC mockup...");
             await Bun.write(ossecConfPath, managerMockup);
-            await applyPerm(ossecConfPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "ossec.conf (manager)");
+            await $`chown root:wazuh ${ossecConfPath} && chmod 660 ${ossecConfPath}`.quiet().catch(() => { });
         }
 
         if (agentMockup) {
             await Bun.write(agentConfPath, agentMockup);
-            await applyPerm(agentConfPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "agent.conf");
+            await $`chown 115:125 ${agentConfPath} && chmod 660 ${agentConfPath}`.quiet().catch(() => { });
         }
     } catch (err) { }
 }
@@ -324,9 +311,7 @@ async function fetchPoliciesV2() {
         if (response.ok) {
             const data = await response.json();
             if (data.success && data.policy) {
-                const filepath = '/var/ossec/etc/runtime_policy.json';
-                await Bun.write(filepath, JSON.stringify(data.policy, null, 2));
-                await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", "runtime_policy.json");
+                await Bun.write('/var/ossec/etc/runtime_policy.json', JSON.stringify(data.policy, null, 2));
                 console.log(`[BOOT] ✅ OpenXDR Phase 1: Fetched and saved runtime_policy.json (v${data.policy.version})`);
             }
         }
@@ -337,14 +322,8 @@ async function fetchPoliciesV2() {
 
 async function main() {
     console.log(`[BOOT] 🚀 Updater service started. Polling every 1 minute.`);
-    await detectWazuhIds();
 
     while (true) {
-        // Retry wazuh uid/gid detection if it hasn't succeeded yet (e.g. /var/ossec wasn't mounted at boot)
-        if (IS_LINUX && (!WAZUH_UID || !WAZUH_GID)) {
-            await detectWazuhIds();
-        }
-
         // 0. Check for Edge Connector script updates
         await checkAndApplyUpdate();
 
@@ -421,25 +400,19 @@ async function syncRulePolicy() {
                 const configData = await configRes.json();
                 const { agent_xml, manager_xml, wazuh_files } = configData;
 
-                const agentMockupPath = '/var/ossec/etc/shared/default/agent_mockup.xml';
-                const managerMockupPath = '/var/ossec/etc/manager_mockup.xml';
-
-                await Bun.write(agentMockupPath, agent_xml);
-                await applyPerm(agentMockupPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "agent_mockup.xml");
-
-                await Bun.write(managerMockupPath, manager_xml);
-                await applyPerm(managerMockupPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "manager_mockup.xml");
+                await Bun.write('/var/ossec/etc/shared/default/agent_mockup.xml', agent_xml);
+                await Bun.write('/var/ossec/etc/manager_mockup.xml', manager_xml);
 
                 if (wazuh_files && Array.isArray(wazuh_files)) {
                     for (const file of wazuh_files) {
                         if (file.type === 'rule') {
                             const p = `/var/ossec/etc/rules/${file.filename}`;
                             await Bun.write(p, file.content);
-                            await applyPerm(p, `${WAZUH_UID}:${WAZUH_GID}`, "660", `queued rule (${file.filename})`);
+                            await $`chown 115:125 ${p} && chmod 660 ${p}`.quiet().catch(() => { });
                         } else if (file.type === 'decoder') {
                             const p = `/var/ossec/etc/decoders/${file.filename}`;
                             await Bun.write(p, file.content);
-                            await applyPerm(p, `${WAZUH_UID}:${WAZUH_GID}`, "660", `queued decoder (${file.filename})`);
+                            await $`chown 115:125 ${p} && chmod 660 ${p}`.quiet().catch(() => { });
                         }
                     }
                 }
@@ -467,3 +440,4 @@ async function syncRulePolicy() {
         console.error(`[BOOT] ❌ [SYNC ERROR]: ${err.message}`);
     }
 }
+
