@@ -1,0 +1,39 @@
+services:
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: suricata
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+      - NET_RAW
+    environment:
+      - SURICATA_INTERFACE=${SURICATA_INTERFACE}
+      - HOME_NET=${HOME_NET}
+      - SURICATA_OPTIONS=-c /etc/suricata/suricata.yaml -i ${SURICATA_INTERFACE} -l /var/log/suricata --set vars.address-groups.HOME_NET=[${HOME_NET}]
+    depends_on:
+      init-rules:
+        condition: service_completed_successfully
+    volumes:
+      - ./log/suricata:/var/log/suricata
+      - ./config/suricata.yaml:/etc/suricata/suricata.yaml
+      - ./rules:/etc/suricata/rules
+    restart: always
+
+  init-rules:
+    image: alpine:latest
+    container_name: suricata-init-rules
+    volumes:
+      - ./rules:/etc/suricata/rules
+      - ./init-rules.sh:/init-rules.sh:ro
+    command: /bin/sh -c "apk add --no-cache bash curl tar && bash /init-rules.sh"
+
+  logrotate:
+    image: alpine:latest
+    container_name: suricata-logrotate
+    volumes:
+      - ./log/suricata:/var/log/suricata
+      - ./config/logrotate.conf:/etc/logrotate.d/suricata:ro
+    # Run crond in foreground, log to stderr
+    command: sh -c "apk add --no-cache logrotate && crond -f -d 8"
+    restart: always
