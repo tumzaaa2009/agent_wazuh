@@ -1,20 +1,6 @@
 #!/bin/bash
 
-if [ -z "$1" ]; then
-  echo "Usage: ./update_version.sh <new_version>"
-  echo "Example: ./update_version.sh 1.0.1"
-  exit 1
-fi
 
-NEW_VERSION=$1
-
-echo "Updating version to $NEW_VERSION..."
-
-# Update version.txt
-echo "$NEW_VERSION" > version.txt
-
-# Update index.ts
-sed -i "s/const EDGE_VERSION = \".*\";/const EDGE_VERSION = \"$NEW_VERSION\";/" index.ts
 
 echo "Building and restarting Docker container..."
 # 1. หยุด Container ที่รันอยู่
@@ -31,5 +17,13 @@ docker compose build --no-cache
 # 4. เริ่มต้น Container ใหม่
 docker compose up -d
 
-echo "✅ Version updated to $NEW_VERSION and container restarted."
-echo "Master API is now serving the new version."
+echo "✅ Container restarted successfully."
+echo "Master API is now serving the updated code."
+
+echo "Restarting Wazuh Manager..."
+SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager || /var/ossec/bin/wazuh-control restart
+if [ $? -ne 0 ]; then
+    echo "❌ [CRITICAL ERROR] Failed to restart Wazuh Manager!"
+    exit 1
+fi
+echo "✅ Wazuh Manager restarted successfully."

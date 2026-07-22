@@ -1,627 +1,545 @@
-import { $, serve } from "bun";
-import * as os from "os";
-import { exec, execSync } from "child_process";
-import { existsSync, readFileSync, writeFileSync } from "fs";
-import { randomBytes } from "crypto";
-import { join } from "path";
+import { spawn, exec, execFile } from "child_process";
+import { promisify } from "util";
+import { existsSync } from "fs";
+import { readFile, writeFile, appendFile } from "fs/promises";
+import * as path from "path";
+import { $ } from "bun";
 
-function getHardwareId(): string {
-  const idPath = join(import.meta.dir, ".device_id");
-  if (existsSync(idPath)) {
-    return readFileSync(idPath, "utf8").trim();
-  }
-  
-  // Generate 256-character random hex string (128 bytes = 256 hex chars)
-  const newId = randomBytes(128).toString("hex");
-  try {
-    writeFileSync(idPath, newId, "utf8");
-    console.log("🔒 Generated new 256-char Hardware ID and saved to .device_id");
-  } catch (err) {
-    console.error("⚠️ Failed to write .device_id:", err);
-  }
-  return newId;
-}
+const execFileAsync = promisify(execFile);
 
-const HARDWARE_ID = getHardwareId();
-
-//ปวดกระบาล uid update////
-
-// --- 0. Set System Timezone (Asia/Bangkok) ---
-function setSystemTimezone() {
-  process.env.TZ = "Asia/Bangkok";
-  const platform = os.platform();
-
-  if (platform === 'win32') {
-    exec('tzutil /s "SE Asia Standard Time"', (err) => {
-      if (err) console.log("⚠️ Failed to set Windows timezone (Run as Admin required):", err.message);
-      else console.log("✅ Successfully set Windows timezone to SE Asia Standard Time");
-    });
-  } else if (platform === 'linux') {
-    // Try timedatectl first, fallback to symlink for Docker containers
-    exec('timedatectl set-timezone Asia/Bangkok || ln -sf /usr/share/zoneinfo/Asia/Bangkok /etc/localtime', (err) => {
-      if (err) console.log("⚠️ Failed to set Linux timezone:", err.message);
-      else console.log("✅ Successfully set Linux timezone to Asia/Bangkok");
-    });
-  }
-}
-setSystemTimezone();
-
-// --- 0.1 Fix Missing Legacy CDB Lists (Prevents API 500 Error) ---
-function setupDummyLists() {
-  const platform = os.platform();
-  if (platform === 'linux') {
-    // Wazuh dashboard API crashes with 500 if these files are missing
-    // Files MUST have at least one valid key:value pair, otherwise wazuh-analysisd fails to load them
-    exec('mkdir -p /var/ossec/etc/lists/malicious-ioc && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-ip && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malicious-domains && echo "dummy:dummy" >> /var/ossec/etc/lists/malicious-ioc/malware-hashes && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_c2_servers && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_virus_sigs && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_compromised && echo "dummy:dummy" >> /var/ossec/etc/lists/queue_malicious_urls && chown -R wazuh:wazuh /var/ossec/etc/lists/malicious-ioc /var/ossec/etc/lists/queue_*', (err) => {
-      if (err) console.log("⚠️ Failed to setup dummy lists:", err.message);
-      else console.log("✅ Successfully verified legacy lists exist.");
-    });
-  }
-}
-setupDummyLists();
-
-function getWazuhLogTimestamp() {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
-const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "";
-const PROVINCE = process.env.PROVINCE || "";
-const ZONE = process.env.ZONE || "";
-const API_KEY = process.env.API_KEY || "";
-const INDEXER_URL = process.env.INDEXER_URL || "";
-const BASE_API_URL = WS_URL.replace("wss://", "https://").replace("/ws/active-response", "");
-const INDEXER_USER = process.env.INDEXER_USER || "";
-const INDEXER_PASSWORD = process.env.INDEXER_PASSWORD || "";
+const CENTRAL_API = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "");
+const BASE_API_URL = CENTRAL_API;
+const API_BASE_V2 = process.env.API_URL_V2 || "https://rh4cloudcenter.moph.go.th/api/v2";
 const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go.th/api/v1/yara-rules";
+const SOC_CONFIG_URL = process.env.SOC_CONFIG_URL || "https://rh4cloudcenter.moph.go.th/api/v1/wazuh-configs";
 
-// Master Version is maintained in agent_version.txt
-import { appendFile } from "fs/promises";
+const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "";
+const API_KEY = process.env.API_KEY || "";
 
-// Override console.log and console.error to write to separate log files
-const originalConsoleLog = console.log;
-const originalConsoleError = console.error;
+// The updater runs inside a container whose own /etc/passwd does NOT have the
+// "wazuh" user/group, even though /var/ossec is bind-mounted from the host where it does.
+// chown/chmod by NAME fails inside the container because name resolution happens in the
+// container's own nsswitch, not the host's. Numeric uid:gid works regardless of names,
+// BUT the actual uid/gid differ across distros (Ubuntu vs AlmaLinux install wazuh with
+// different ids), so we can't hardcode a single number — we detect it at runtime.
+// Env override (WAZUH_UID / WAZUH_GID) always wins if set.
+let WAZUH_UID = process.env.WAZUH_UID || "";
+let WAZUH_GID = process.env.WAZUH_GID || "";
+const ROOT_UID = process.env.ROOT_UID || "0";
+const IS_LINUX = process.platform === "linux";
 
-const logDir = "/app/logs";
-if (!existsSync(logDir)) {
-  import("fs").then(fs => fs.mkdirSync(logDir, { recursive: true })).catch(() => { });
-}
-
-const LOG_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per log file
-
-async function rotateIfNeeded(filepath: string) {
+// Reads /etc/os-release to identify the distro family (Ubuntu/Debian, RHEL/AlmaLinux/CentOS/Rocky, ...).
+// Used purely for logging/diagnostics so we know which fallback path was needed on which distro.
+async function getOsType(): Promise<string> {
   try {
-    const file = Bun.file(filepath);
-    if (await file.exists() && file.size > LOG_MAX_BYTES) {
-      const backupPath = filepath.replace('.log', '.old.log');
-      await $`mv -f ${filepath} ${backupPath}`.quiet();
-    }
-  } catch { }
+    const content = await readFile("/etc/os-release", "utf-8");
+    const idMatch = content.match(/^ID="?([^"\n]*)"?$/m);
+    const idLikeMatch = content.match(/^ID_LIKE="?([^"\n]*)"?$/m);
+    const id = idMatch ? idMatch[1].trim() : "";
+    const idLike = idLikeMatch ? idLikeMatch[1].trim() : "";
+    return [id, idLike].filter(Boolean).join(" / ") || "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
-async function writeLog(level: "INFO" | "ERROR", ...args: any[]) {
-  const msg = args.map(a => (typeof a === 'object' && a !== null) ? JSON.stringify(a) : String(a)).join(" ");
-  const timestamp = new Date().toISOString();
-  const logStr = `[${timestamp}] [${level}] ${msg}\n`;
-
-  if (level === "ERROR") {
-    originalConsoleError(...args);
-  } else {
-    originalConsoleLog(...args);
+async function detectWazuhIds() {
+  if (!IS_LINUX) {
+    console.log(`[PERM] ℹ️ Platform is '${process.platform}', not Linux — skipping unix chown/chmod entirely.`);
+    return;
+  }
+  if (WAZUH_UID && WAZUH_GID) {
+    console.log(`[PERM] ℹ️ Using WAZUH_UID/WAZUH_GID from env: ${WAZUH_UID}:${WAZUH_GID}`);
+    return;
   }
 
-  let system = "system";
-  const lowerMsg = msg.toLowerCase();
+  const osType = await getOsType();
+  console.log(`[PERM] ℹ️ Host OS family: ${osType}`);
 
-  // Categorize log based on keywords
-  if (lowerMsg.includes("yara") || lowerMsg.includes("malware") || lowerMsg.includes("quarantine")) {
-    system = "yara";
-  } else if (lowerMsg.includes("soc configs") || lowerMsg.includes("wazuh") || lowerMsg.includes("mockup") || lowerMsg.includes("ossec.conf") || lowerMsg.includes("agent.conf") || lowerMsg.includes("policy")) {
-    system = "wazuh";
-  } else if (lowerMsg.includes("firewall") || lowerMsg.includes("active response") || lowerMsg.includes("queue item") || lowerMsg.includes("ack") || lowerMsg.includes("srcip")) {
-    system = "active-response";
-  }
-
-  const logPath = `${logDir}/${system}.log`;
-  await rotateIfNeeded(logPath);
-  await appendFile(logPath, logStr).catch(() => { });
-}
-
-console.log = (...args) => { writeLog("INFO", ...args); };
-console.error = (...args) => { writeLog("ERROR", ...args); };
-
-console.log("🚀 Starting Hospital Edge Connector (Bun/TypeScript)...");
-console.log(`🏥 Hospital Code: ${HOSPITAL_CODE}`);
-
-// ---------------------------------------------------------
-// Report Malware Event to Central SOC
-// ---------------------------------------------------------
-async function reportMalwareEvent(eventData: {
-  hash_sha256: string;
-  hash_md5: string;
-  filename: string;
-  filepath: string;
-  yara_rule_matched: string;
-  agent_id: string;
-  agent_name: string;
-  action_taken: string;
-}) {
-  const API_BASE = process.env.API_URL || "https://rh4cloudcenter.moph.go.th/api/v1";
-  const payload = {
-    ...eventData,
-    hospital_code: HOSPITAL_CODE,
-    hospital_name: HOSPITAL_NAME,
-    timestamp: new Date().toISOString()
-  };
+  // Method 1 (primary): `id wazuh`
+  // Output format: uid=115(wazuh) gid=125(wazuh) groups=125(wazuh)
+  // This is POSIX/coreutils standard and works the same way on Ubuntu/Debian, RHEL/AlmaLinux/
+  // CentOS/Rocky, etc. — as long as the container can resolve the "wazuh" user (e.g. /etc/passwd
+  // is shared/bind-mounted, or nsswitch is configured to see it).
   try {
-    const res = await fetch(`${API_BASE}/malware-events`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${API_KEY}`,
-        'X-Hardware-Id': HARDWARE_ID,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-      },
-      body: JSON.stringify(payload)
-    });
-    console.log(`📤 Malware event reported to SOC: ${res.status}`);
-    await appendFile('/var/ossec/logs/integrations.log',
-      `[malware-event] ${payload.filepath} -> ${res.status}\n`
-    ).catch(() => { });
-  } catch (err) {
-    console.error("❌ Failed to report malware event to SOC:", err);
-    // Log locally so we don't lose the event
-    await appendFile('/var/ossec/logs/integrations.log',
-      `[malware-event-fail] ${JSON.stringify(payload)}\n`
-    ).catch(() => { });
-  }
-}
-
-// ---------------------------------------------------------
-// IP Validation helper to prevent catastrophic blocks
-// ---------------------------------------------------------
-function isSafeToBlock(ip: string): boolean {
-  if (!ip || typeof ip !== "string") return false;
-  const tIp = ip.trim();
-
-  // Protect localhost
-  if (tIp === "127.0.0.1" || tIp === "::1" || tIp === "0.0.0.0" || tIp === "0.0.0.0/0") return false;
-
-  // Auto-detect: protect this machine's own IPs
-  const nets = os.networkInterfaces();
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name] || []) {
-      if (net.address === tIp) return false;
+    const { stdout } = await execFileAsync("id", ["wazuh"]);
+    const uidMatch = stdout.match(/uid=(\d+)/);
+    const gidMatch = stdout.match(/gid=(\d+)/);
+    if (uidMatch && gidMatch) {
+      WAZUH_UID = uidMatch[1];
+      WAZUH_GID = gidMatch[1];
+      console.log(`[PERM] ✅ Detected wazuh uid:gid = ${WAZUH_UID}:${WAZUH_GID} (via 'id wazuh', OS: ${osType})`);
+      return;
     }
+    console.error(`[PERM] ⚠️ 'id wazuh' returned unexpected output, could not parse uid/gid: ${stdout.trim()}`);
+  } catch (e: any) {
+    console.error(`[PERM] ⚠️ 'id wazuh' failed (${e.stderr?.toString().trim() || e.message}) — trying distro-agnostic fallback ('getent')...`);
   }
 
-  const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
-  return ipv4Regex.test(tIp);
-}
+  // Method 2 (fallback): `getent passwd wazuh`
+  // Reads directly from whatever nsswitch source is configured (files, ldap, sssd, ...), so it
+  // covers the same distros as Method 1 but can succeed in cases where `id` itself isn't on PATH
+  // or behaves oddly in a minimal container image.
+  // Format: wazuh:x:115:125:wazuh:/var/ossec:/sbin/nologin
+  try {
+    const { stdout: passwdLine } = await execFileAsync("getent", ["passwd", "wazuh"]);
+    const parts = passwdLine.trim().split(":");
+    if (parts.length >= 4 && parts[2] && parts[3]) {
+      WAZUH_UID = parts[2];
+      WAZUH_GID = parts[3];
+      console.log(`[PERM] ✅ Detected wazuh uid:gid = ${WAZUH_UID}:${WAZUH_GID} (via 'getent passwd wazuh', OS: ${osType})`);
+      return;
+    }
+    console.error(`[PERM] ⚠️ 'getent passwd wazuh' returned unexpected output: ${passwdLine.trim()}`);
+  } catch (e: any) {
+    console.error(`[PERM] ⚠️ 'getent passwd wazuh' failed (${e.stderr?.toString().trim() || e.message}) — trying stat-based fallback on known wazuh paths...`);
+  }
 
-async function processQueueItem(item: any, ws?: WebSocket) {
-  const { id: log_id, command, srcip, timeout, agent_id, agent_name } = item;
-
-  const API_BASE_URL = WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "/api/v1");
-
-  // Send ACK Received via API
-  fetch(`${API_BASE_URL}/active-response/receive`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
-  }).catch(err => console.error("Failed to send receive ACK:", err));
-
-  if (command === "soc-firewall-drop" || command === "firewall-drop") {
-    if (srcip && agent_id) {
-      if (!isSafeToBlock(srcip)) {
-        console.error(`⚠️ BLOCKED ACTION: Attempted to drop invalid/unsafe IP: ${srcip}. Ignored.`);
-
-        // Send ACK back so SOC knows it was rejected
-        if (ws) {
-          const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "rejected", reason: "Unsafe IP", log_id };
-          ws.send(JSON.stringify(ackMsg));
-        }
-        fetch(`${API_BASE_URL}/active-response/success`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE, status: "rejected_unsafe_ip" })
-        }).catch(err => console.error("Failed to send reject ACK:", err));
-
+  // Method 3 (last resort): stat-based probe.
+  // If the "wazuh" user can't be resolved at all inside the container (e.g. fully detached from
+  // the host's user database), the bind-mounted files still carry the correct numeric ownership,
+  // so we infer uid/gid from a path Wazuh itself already owns.
+  const probePaths = ["/var/ossec/logs", "/var/ossec/queue", "/var/ossec/var/run", "/var/ossec/etc/shared"];
+  for (const p of probePaths) {
+    try {
+      const { stdout } = await execFileAsync("stat", ["-c", "%u:%g", p]);
+      const [uid, gid] = stdout.trim().split(":");
+      if (uid && gid && uid !== "0") {
+        WAZUH_UID = uid;
+        WAZUH_GID = gid;
+        console.log(`[PERM] ✅ Detected wazuh uid:gid = ${uid}:${gid} (via stat fallback on ${p}, OS: ${osType})`);
         return;
       }
+    } catch { /* try next path */ }
+  }
 
-      const dropMsg = `🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`;
-      console.log(dropMsg);
-      // ส่งเข้า syslog
-      await $`logger -t HOS-Edge-Connector ${dropMsg}`.catch((err: any) => console.error("Syslog error:", err));
+  console.error(`[PERM] ❌ Could not auto-detect wazuh uid/gid on this host via 'id', 'getent', or stat probe (OS: ${osType}, tried: ${probePaths.join(", ")}). Set WAZUH_UID/WAZUH_GID env vars manually.`);
+}
 
-      try {
-        // Detect OS dynamically
-        let isWindows = false;
-        let isUbuntu = false;
-        let isCentosAlma = false;
+const currentDir = import.meta.dir;
+const dataDir = currentDir === '/app' ? currentDir : path.join(currentDir, "..");
+const versionFile = path.join(dataDir, 'agent_version.txt');
+const scriptFile = path.join(currentDir, 'index.ts');
 
-        if (agent_id === "000") {
-          try {
-            const osRelease = await Bun.file('/etc/os-release').text();
-            const osLower = osRelease.toLowerCase();
-            if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
-            else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
-          } catch (e) { }
-        } else {
-          try {
-            const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
-            const osLine = infoOutput.split('\n').find((l: string) => l.toLowerCase().includes('operating system:'));
-            if (osLine) {
-              const osLower = osLine.toLowerCase();
-              if (osLower.includes('windows')) isWindows = true;
-              else if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
-              else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
-            }
-          } catch (e) { }
-        }
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-        if (agent_id === "000") {
-          // 1. Local Manager (Agent 000)
-          let arScript = '/var/ossec/active-response/bin/firewall-drop';
-          if (isUbuntu) arScript = '/var/ossec/active-response/bin/firewall-drop';
-          else if (isCentosAlma) arScript = '/var/ossec/active-response/bin/firewalld-drop';
-
-          try {
-            console.log(`🚀 Executing local ${arScript} to block ${srcip}`);
-            const child = Bun.spawn([arScript], {
-              stdin: 'pipe',
-              stdout: 'pipe',
-              stderr: 'pipe'
-            });
-
-            // Write initial ADD message
-            const addMsg = JSON.stringify({
-              command: "add",
-              parameters: {
-                extra_args: [],
-                alert: { data: { srcip: srcip } },
-                program: "active-response/bin/firewall-drop"
-              }
-            });
-            child.stdin.write(addMsg + "\n");
-            child.stdin.flush();
-
-            // We need to read stdout to consume the continue request
-            (async () => {
-              try {
-                const reader = child.stdout.getReader();
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-                  const output = new TextDecoder().decode(value);
-                  if (output.includes('"command":"continue"')) {
-                    const continueMsg = JSON.stringify({
-                      command: "continue",
-                      parameters: { keys: [srcip] }
-                    });
-                    child.stdin.write(continueMsg + "\n");
-                    child.stdin.flush();
-                    child.stdin.end();
-                    break;
-                  }
-                }
-              } catch (e) {
-                console.error("Error reading AR stdout:", e);
-              }
-            })();
-
-            await child.exited;
-            console.log(`✅ Successfully executed local block for ${srcip}`);
-          } catch (spawnErr) {
-            console.error(`❌ Failed to spawn local AR script:`, spawnErr);
-          }
-        } else {
-          // 2. Remote Agent (Agent 001+)
-          let arName = 'firewall-drop';
-          try {
-            const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-            if (isWindows) {
-              const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
-              arName = match ? match[1] : 'netsh';
-            } else if (isCentosAlma) {
-              const match = arOutput.match(/Response name: (firewalld?-drop\d*)/);
-              arName = match ? match[1] : 'firewalld-drop';
-            } else {
-              const match = arOutput.match(/Response name: (firewall-drop\d*|host-deny\d*)/);
-              arName = match ? match[1] : 'firewall-drop';
-            }
-          } catch (e) {
-            if (isWindows) arName = 'netsh';
-            else if (isCentosAlma) arName = 'firewalld-drop';
-            else arName = 'firewall-drop';
-          }
-
-          console.log(`🚀 Triggering ${arName} on remote agent ${agent_id} (${isWindows ? 'Windows' : (isUbuntu ? 'Ubuntu' : 'CentOS/Linux')}) to block ${srcip}`);
-          await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id}`);
-        }
-      } catch (err) {
-        console.error(`❌ Failed to trigger active response via agent_control:`, err);
-      }
-
-      // Send ACK back if WebSocket is provided
-      if (ws) {
-        const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id };
-        ws.send(JSON.stringify(ackMsg));
-      }
-
-      // Send HTTP REST API ACK for success
-      fetch(`${API_BASE_URL}/active-response/success`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE })
-      }).catch(err => console.error("Failed to send success ACK:", err));
-
-      console.log(`✅ Queue item ${log_id} processed. (Sent HTTP ACK)`);
-    } else {
-      console.error(`⚠️ Cannot drop firewall: Missing srcip (${srcip}) or agent_id (${agent_id})`);
-    }
-  } else if (command === "yara-scan") {
-    // Determine the filepath from arguments or payload
-    const filepath = item.filepath || item.srcip || (item.arguments ? item.arguments[0] : null);
-    if (filepath) {
-      console.log(`🔍 Received YARA scan request for file: ${filepath}`);
-      try {
-        let yaraOutput = "";
-        if (agent_id && agent_id !== "000") {
-          // Detect agent OS
-          const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
-          const isWindows = infoOutput.toLowerCase().includes('windows');
-          const arName = isWindows ? 'yara_windows' : 'yara_linux';
-
-          console.log(`📡 Agent ${agent_id} is ${isWindows ? 'Windows' : 'Linux'}. Triggering ${arName}...`);
-          await $`/var/ossec/bin/agent_control -b ${filepath} -f ${arName} -u ${agent_id}`;
-          yaraOutput = `Sent command ${arName} to agent ${agent_id} for file ${filepath}`;
-          console.log(`✅ ${yaraOutput}`);
-        } else {
-          // Local fallback (agent_id = "000" — Manager itself)
-          yaraOutput = await $`/usr/bin/yara -w -r /app/yara_rules.yar ${filepath}`.text();
-          console.log(`✅ YARA Scan complete.`);
-          if (yaraOutput.trim() !== "") {
-            console.log(`🚨 Malware Detected! Results:\n${yaraOutput}`);
-
-            // Step 1: Compute hashes BEFORE deleting
-            const sha256Result = await $`sha256sum ${filepath}`.text().catch(() => "");
-            const md5Result = await $`md5sum ${filepath}`.text().catch(() => "");
-            const sha256 = sha256Result.split(" ")[0] || "";
-            const md5 = md5Result.split(" ")[0] || "";
-
-            // Step 2: Delete the malware file
-            await $`rm -f ${filepath}`.catch((e: any) => console.error(`❌ Failed to delete ${filepath}:`, e));
-            console.log(`🗑️ Malware file deleted: ${filepath}`);
-
-            // Step 3: Write QUARANTINED log for Wazuh Decoder
-            await appendFile('/var/ossec/logs/active-responses.log',
-              `QUARANTINED src=${filepath} dest=DELETED sha256=${sha256} md5=${md5} yara_match=${yaraOutput.trim().replace(/\n/g, '|')}\n`
-            ).catch((e: any) => console.error("❌ Failed to write QUARANTINED log:", e));
-
-            // Step 4: Report Hash + Event to Central SOC
-            await reportMalwareEvent({
-              hash_sha256: sha256,
-              hash_md5: md5,
-              filename: filepath.split("/").pop() || filepath,
-              filepath,
-              yara_rule_matched: yaraOutput.trim(),
-              agent_id: agent_id || "000",
-              agent_name: agent_name || "Manager",
-              action_taken: "DELETED"
-            });
-          } else {
-            console.log(`🟢 No malware found in ${filepath}`);
-          }
-        }
-
-        // Send ACK back if WebSocket is provided
-        if (ws) {
-          const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id, scan_result: yaraOutput };
-          ws.send(JSON.stringify(ackMsg));
-        }
-
-        // Send HTTP REST API ACK for success
-        fetch(`${API_BASE_URL}/active-response/success`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE, scan_result: yaraOutput })
-        }).catch(err => console.error("Failed to send success ACK:", err));
-      } catch (err) {
-        console.error(`❌ YARA Scan failed:`, err);
-      }
-    } else {
-      console.error(`⚠️ Cannot perform YARA scan: Missing filepath.`);
-    }
+// Applies owner:group + chmod to a path using the REAL system chown/chmod binaries
+// (via execFile, no shell involved) — avoids Bun Shell's built-in chown mis-parsing "user:group".
+// No-ops safely on non-Linux platforms (e.g. Windows agents) since unix ownership doesn't apply there.
+// Always logs the result (success, failure, or skip).
+async function applyPerm(filepath: string, owner: string, mode: string, label: string) {
+  if (!IS_LINUX) {
+    console.log(`[PERM] ⏭️ ${label}: skipped (platform '${process.platform}' has no unix chown/chmod) — ${filepath}`);
+    return;
+  }
+  if (owner.includes("undefined") || owner.startsWith(":") || owner.endsWith(":")) {
+    console.error(`[PERM] ❌ ${label}: skipped — wazuh uid/gid not detected yet, owner was '${owner}' on ${filepath}`);
+    return;
+  }
+  try {
+    await execFileAsync("chown", [owner, filepath]);
+    await execFileAsync("chmod", [mode, filepath]);
+    console.log(`[PERM] ✅ ${label}: ${filepath} -> ${owner} ${mode}`);
+  } catch (e: any) {
+    console.error(`[PERM] ❌ ${label}: FAILED to set ${owner} ${mode} on ${filepath} — ${e.stderr?.toString().trim() || e.message}`);
   }
 }
 
-// ---------------------------------------------------------
-// WebSocket Flow (Push-based)
-// ---------------------------------------------------------
-function connect() {
-  console.log(`🔗 Connecting to Central SOC WebSocket at ${WS_URL}...`);
-  const ws = new WebSocket(WS_URL);
-
-  ws.onopen = () => {
-    console.log("✅ Connected to Central SOC WebSocket!");
-
-    const registerMsg = {
-      type: "register",
-      hospital_code: HOSPITAL_CODE,
-      hospital_name: HOSPITAL_NAME,
-      province: PROVINCE,
-      zone: ZONE,
-      api_key: API_KEY,
-      hardware_id: HARDWARE_ID,
-      indexer_url: INDEXER_URL,
-      indexer_user: INDEXER_USER,
-      indexer_password: INDEXER_PASSWORD
-    };
-    ws.send(JSON.stringify(registerMsg));
-  };
-
-  ws.onmessage = async (event) => {
-    try {
-      const data = JSON.parse(event.data.toString());
-      console.log("📥 Received message:", data);
-
-      // 1. Handle old single payload push format
-      if (data.action === "execute_active_response") {
-        const { log_id, command, arguments: args, agent_id, agent_name } = data.payload || {};
-        await processQueueItem({
-          id: log_id,
-          command: command,
-          srcip: args ? args[0] : null,
-          timeout: args ? args[1] : 3600,
-          agent_id,
-          agent_name
-        }, ws);
+async function checkAndApplyUpdate(): Promise<boolean> {
+  try {
+    console.log(`[BOOT] 📥 Checking for edge connector updates...`);
+    const res = await fetch(`${CENTRAL_API}/api/v1/edge-connector/version`);
+    if (res.ok) {
+      const data = await res.json();
+      let localVersion = "";
+      if (existsSync(versionFile)) {
+        const content = await readFile(versionFile, "utf-8");
+        localVersion = content.split('\n')[0].trim().replace(" used", "");
       }
-
-      // Handle rule policy update action
-      if (data.action === "update_policy") {
-        console.log("📥 Received update_policy trigger from Central SOC");
-        await syncRulePolicy();
-      }
-
-      // Handle threat intel sync
-      if (data.action === "SYNC_THREAT_INTEL") {
-        console.log("📥 Received SYNC_THREAT_INTEL trigger from Central SOC");
-        await downloadMispCdb();
-      }
-
-      // Handle agent patch update action
-      if (data.action === "update_agent") {
-        console.log("📥 Received update_agent trigger from Central SOC");
-        console.log("🔄 Deleting agent_version.txt to force edge-updater to pull new version...");
-        try {
-          if (existsSync(`${import.meta.dir}/agent_version.txt`)) {
-            await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
-          }
-        } catch (e) {
-          console.error("❌ Failed to delete agent_version.txt:", e);
+      if (data.success && data.version && data.version !== localVersion) {
+        console.log(`[BOOT] 🚀 New version detected! Remote: ${data.version}, Local: ${localVersion}`);
+        console.log(`[BOOT] 📥 Downloading new index.ts...`);
+        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/edge-connector/script`);
+        if (scriptRes.ok) {
+          const scriptText = await scriptRes.text();
+          await writeFile(scriptFile, scriptText);
+          await writeFile(versionFile, data.version + " used\n");
+          console.log(`[BOOT] ✅ Successfully updated local script to version ${data.version}.`);
+          console.log(`[BOOT] 🔄 Running update_version.sh to apply changes...`);
+          await $`./update_version.sh ${data.version}`.quiet().catch(() => { });
+          return true;
+        } else {
+          console.error(`[BOOT] ❌ Failed to download script. Status: ${scriptRes.status}`);
         }
+      } else {
+        console.log(`[BOOT] ✅ Agent is up to date (Local: ${localVersion}).`);
       }
-
-      // 2. Handle new Array payload format (if pushed via WS)
-      if (Array.isArray(data) && data[0]?.success && data[0]?.queues) {
-        const queues = data[0].queues;
-        console.log(`📥 Processing ${queues.length} queue items from WS array`);
-        for (const item of queues) {
-          await processQueueItem(item, ws);
-        }
-      }
-
-    } catch (e) {
-      console.error("❌ Error processing message:", e);
+    } else {
+      console.error(`[BOOT] ❌ Failed to fetch version info. Status: ${res.status}`);
     }
-  };
-
-  ws.onclose = () => {
-    console.log("❌ Disconnected from Central SOC. Reconnecting in 5 seconds...");
-    setTimeout(connect, 5000);
-  };
-
-  ws.onerror = (error) => {
-    console.error("⚠️ WebSocket Error:", error);
-    ws.close();
-  };
+  } catch (err: any) {
+    console.error(`[BOOT] ❌ Update check error: ${err.message}`);
+  }
+  return false;
 }
 
-
-
-// ---------------------------------------------------------
-// HTTP Polling Flow (Pull-based API) - Optional
-// ---------------------------------------------------------
-async function pollApiQueue() {
-  const API_QUEUE_URL = process.env.API_QUEUE_URL || `${WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "")}/api/v1/active-response/queues`;
+async function checkCustomSocUpdate() {
+  const versionFileSOC = `${dataDir}/version_custom_soc.txt`;
+  exec(`mkdir -p /var/hos-edge-connector`);
+  const scriptFileSOC = `${dataDir}/custom-soc`;
+  const wazuhIntegrationPath = "/var/ossec/integrations/custom-soc";
 
   try {
-    const response = await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}`, {
+    let localVersion = "";
+    if (existsSync(versionFileSOC)) {
+      const content = await Bun.file(versionFileSOC).text();
+      localVersion = content.split('\n')[0].trim().replace(" used", "");
+    } else {
+      await Bun.write(versionFileSOC, "");
+    }
+
+    if (!existsSync(wazuhIntegrationPath) && existsSync(scriptFileSOC)) {
+      console.log(`[BOOT] 📥 Restoring missing custom-soc to Wazuh from local backup...`);
+      const scriptText = await Bun.file(scriptFileSOC).text();
+      await $`rm -f ${wazuhIntegrationPath}`.quiet().catch((e) => console.error(`[PERM] ❌ rm failed on ${wazuhIntegrationPath}: ${e.stderr?.toString() || e.message}`));
+      await Bun.write(wazuhIntegrationPath, scriptText);
+      await applyPerm(wazuhIntegrationPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "custom-soc restore (integrations)");
+    }
+
+    console.log(`[BOOT] 📥 Querying API for latest Custom SOC patches...`);
+    const res = await fetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && data.version && data.version !== localVersion) {
+        console.log(`[BOOT] 🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}.`);
+        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
+        if (scriptRes.ok) {
+          const scriptText = await scriptRes.text();
+          await $`rm -f ${scriptFileSOC}`.quiet().catch((e) => console.error(`[PERM] ❌ rm failed on ${scriptFileSOC}: ${e.stderr?.toString() || e.message}`));
+          await Bun.write(scriptFileSOC, scriptText);
+          await Bun.write(versionFileSOC, data.version + " used\n");
+          await applyPerm(scriptFileSOC, `${ROOT_UID}:${WAZUH_GID}`, "750", "custom-soc backup copy");
+          await $`rm -f ${wazuhIntegrationPath}`.quiet().catch((e) => console.error(`[PERM] ❌ rm failed on ${wazuhIntegrationPath}: ${e.stderr?.toString() || e.message}`));
+          await Bun.write(wazuhIntegrationPath, scriptText);
+          await applyPerm(wazuhIntegrationPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "custom-soc remote update (integrations)");
+          await restartWazuh("custom-soc patch");
+          console.log(`[BOOT] ✅ Successfully updated custom-soc.`);
+        }
+      }
+    }
+  } catch (err) { }
+}
+
+async function fetchYaraRules() {
+  try {
+    console.log(`[BOOT] 📥 Checking YARA rules version...`);
+    const RULES_PATH = "/var/ossec/etc/shared/default/yara_rules.yar";
+    try {
+      const versionRes = await fetch(`${YARA_API_URL}/version`, { signal: AbortSignal.timeout(5000) });
+      if (versionRes.ok) {
+        const vData = await versionRes.json();
+        const versionFile = `${dataDir}/yara_rules_version.txt`;
+        if (existsSync(versionFile)) {
+          const content = await Bun.file(versionFile).text();
+          let localVersion = content.split('\n')[0].trim().replace(" used", "");
+          if (localVersion === String(vData.version)) return;
+        }
+        const response = await fetch(YARA_API_URL);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.success && data.rules) {
+            let combinedRules = "";
+            for (const rule of data.rules) {
+              combinedRules += Buffer.from(rule.content, 'base64').toString('utf-8') + "\n";
+            }
+            await Bun.write(RULES_PATH, combinedRules);
+            await applyPerm(RULES_PATH, `${WAZUH_UID}:${WAZUH_GID}`, "660", "YARA rules");
+            await Bun.write(versionFile, String(vData.version) + " used\n");
+            console.log(`[BOOT] ✅ Successfully updated YARA rules.`);
+          }
+        }
+      }
+    } catch { }
+  } catch (err) { }
+}
+
+async function checkMispUpdates() {
+  try {
+    console.log(`[BOOT] 📥 Checking for MISP updates...`);
+    const res = await fetch(`${BASE_API_URL}/api/v1/threat-intel/misp-version`, {
+      headers: { "Authorization": `Bearer ${API_KEY}` }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && data.version) {
+        const versionFile = `${dataDir}/version_misp_ioc.txt`;
+        if (existsSync(versionFile)) {
+          const content = await Bun.file(versionFile).text();
+          let localVersion = content.split('\n')[0].trim().replace(" used", "");
+          if (localVersion === data.version) return;
+        }
+        console.log(`[BOOT] 📥 MISP IOC updates found (${data.version})! Downloading...`);
+        const types = [
+          { url: 'misp-ip.txt', file: 'misp_ip' },
+          { url: 'misp-domain.txt', file: 'misp_domain' },
+          { url: 'misp-hash.txt', file: 'misp_hash' },
+          // Queue-sourced IOC CDB lists
+          { url: 'queue-c2.txt', file: 'queue_c2_servers' },
+          { url: 'queue-virus.txt', file: 'queue_virus_sigs' },
+          { url: 'queue-compromised.txt', file: 'queue_compromised' },
+          { url: 'queue-urls.txt', file: 'queue_malicious_urls' }
+        ];
+        exec(`mkdir -p /var/ossec/etc/lists`);
+        for (const { url, file } of types) {
+          const r = await fetch(`${BASE_API_URL}/api/v1/threat-intel/${url}`, { headers: { "Authorization": `Bearer ${API_KEY}` } });
+          if (r.ok) {
+            const filepath = `/var/ossec/etc/lists/${file}`;
+            await Bun.write(filepath, await r.text());
+            await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", `MISP list (${file})`);
+          }
+        }
+        await Bun.write(versionFile, data.version + " used\n");
+        await restartWazuh("MISP IOC update");
+      }
+    }
+  } catch (err) { }
+}
+
+async function fetchSocConfigs() {
+  try {
+    console.log(`[BOOT] 📥 Checking for SOC configs updates...`);
+    const versionRes = await fetch(`${SOC_CONFIG_URL}/version`);
+    if (versionRes.ok) {
+      const vData = await versionRes.json();
+      if (vData.success && vData.version) {
+        const versionFile = `${dataDir}/version_wazuh_configs.txt`;
+        if (existsSync(versionFile)) {
+          const localVersion = (await Bun.file(versionFile).text()).split('\n')[0]?.trim() || "";
+          const remoteVersion = String(vData.version).split('\n')[0]?.trim() || "";
+          if (localVersion === remoteVersion || localVersion === `${remoteVersion} used`) return;
+        }
+        console.log(`[BOOT] 📥 Updates found! Fetching latest SOC configs...`);
+        const response = await fetch(SOC_CONFIG_URL);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.success) {
+            if (data.rules) {
+              for (const rule of data.rules) {
+                const filepath = `/var/ossec/etc/rules/${rule.filename}`;
+                await Bun.write(filepath, Buffer.from(rule.content, 'base64').toString('utf-8'));
+                await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", `SOC config rule (${rule.filename})`);
+              }
+            }
+            if (data.decoders) {
+              for (const decoder of data.decoders) {
+                const filepath = `/var/ossec/etc/decoders/${decoder.filename}`;
+                await Bun.write(filepath, Buffer.from(decoder.content, 'base64').toString('utf-8'));
+                await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", `SOC config decoder (${decoder.filename})`);
+              }
+            }
+            const remoteVersion = String(vData.version).split('\n')[0]?.trim() || "";
+            await Bun.write(versionFile, remoteVersion + " used\n");
+
+            if (data.mockup_agent || data.mockup_manager) {
+              await autoInjectWazuhConfigs(data);
+            }
+
+            await restartWazuh("SOC Config update");
+            console.log("[BOOT] ✅ Wazuh configs synced successfully!");
+          }
+        }
+      }
+    }
+  } catch (err) { }
+}
+
+async function autoInjectWazuhConfigs(data: any) {
+  if (!data.mockup_agent && !data.mockup_manager) return;
+  const ossecConfPath = '/var/ossec/etc/ossec.conf';
+  const agentConfPath = '/var/ossec/etc/shared/default/agent.conf';
+  try {
+    let managerMockup = data.mockup_manager ? Buffer.from(data.mockup_manager, 'base64').toString('utf-8') : "";
+    let agentMockup = data.mockup_agent ? Buffer.from(data.mockup_agent, 'base64').toString('utf-8') : "";
+
+    if (managerMockup) {
+      console.log("⚙️ Overwriting ossec.conf with central SOC mockup...");
+      await Bun.write(ossecConfPath, managerMockup);
+      await applyPerm(ossecConfPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "ossec.conf (manager)");
+    }
+
+    if (agentMockup) {
+      await Bun.write(agentConfPath, agentMockup);
+      await applyPerm(agentConfPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "agent.conf");
+    }
+  } catch (err) { }
+}
+
+async function fetchPoliciesV2() {
+  const API_BASE_V2 = process.env.API_URL_V2 || "https://rh4cloudcenter.moph.go.th/api/v2";
+  try {
+    console.log(`[BOOT] 📥 Checking for OpenXDR Policy updates...`);
+    const response = await fetch(`${API_BASE_V2}/policies/${HOSPITAL_CODE}`, {
       method: "GET",
       headers: { "Authorization": `Bearer ${API_KEY}` }
     });
 
     if (response.ok) {
       const data = await response.json();
-      if (data && data.success && Array.isArray(data.queues)) {
-        const queues = data.queues;
-        if (queues.length > 0) {
-          console.log(`🔄 Polled ${queues.length} items from API`);
-          for (const item of queues) {
-            await processQueueItem(item);
-
-            // Note: After processing, you should call DELETE API to clear the queue
-            await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}&srcip=${item.srcip}`, {
-              method: "DELETE",
-              headers: { "Authorization": `Bearer ${API_KEY}` }
-            });
-            console.log(`🗑️ Cleared queue for ${item.srcip}`);
-          }
-          
-          // If there are more items in the queue, fetch the next batch quickly
-          if (data.total_queued && data.total_queued > queues.length) {
-             console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
-             setTimeout(pollApiQueue, 2000);
-          }
-        }
+      if (data.success && data.policy) {
+        const filepath = '/var/ossec/etc/runtime_policy.json';
+        await Bun.write(filepath, JSON.stringify(data.policy, null, 2));
+        await applyPerm(filepath, `${WAZUH_UID}:${WAZUH_GID}`, "660", "runtime_policy.json");
+        console.log(`[BOOT] ✅ OpenXDR Phase 1: Fetched and saved runtime_policy.json (v${data.policy.version})`);
       }
     }
   } catch (err) {
-    console.error("❌ API Polling Error:", err);
+    console.error("[BOOT] ❌ API v2 Policy Fetch Error:", err);
   }
 }
 
+async function main() {
+  console.log(`[BOOT] 🚀 Updater service started. Polling every 1 minute.`);
+  await detectWazuhIds();
 
-// WebSocket connection
-connect();
-
-// HTTP API Polling fallback (every 30 seconds — WebSocket is primary)
-pollApiQueue(); // Call immediately on startup
-setInterval(pollApiQueue, 30 * 1000);
-
-
-
-// ---------------------------------------------------------
-// Master Server API (Only runs if IS_MASTER=true)
-// ---------------------------------------------------------
-if (process.env.IS_MASTER === "true") {
-  console.log("👑 Starting Master API Server on port 5050...");
-  Bun.serve({
-    port: 5050,
-    async fetch(req) {
-      const url = new URL(req.url);
-
-      if (url.pathname === "/api/v1/edge-connector/version") {
-        try {
-          const versionContent = await Bun.file(`${import.meta.dir}/agent_version.txt`).text();
-          const lines = versionContent.split('\n').filter(l => l.trim().length > 0);
-          const usedLine = lines.find(l => l.endsWith(' used')) || lines[0] || '';
-          const currentHash = usedLine.replace(' used', '').trim();
-          return Response.json({ success: true, version: currentHash });
-        } catch (err) {
-          return Response.json({ success: false, error: "agent_version.txt not found" }, { status: 404 });
-        }
-      }
-
-      if (url.pathname === "/api/v1/edge-connector/script") {
-        try {
-          const script = await Bun.file('/app/index.ts').text();
-          return new Response(script, {
-            headers: { "Content-Type": "text/plain" }
-          });
-        } catch (err) {
-          return Response.json({ success: false, error: "index.ts not found" }, { status: 404 });
-        }
-      }
-
-      return Response.json({ success: false, error: "Not Found" }, { status: 404 });
+  while (true) {
+    if (IS_LINUX && (!WAZUH_UID || !WAZUH_GID)) {
+      await detectWazuhIds();
     }
-  });
+
+    await checkAndApplyUpdate();
+    await fetchPoliciesV2();
+    await checkCustomSocUpdate();
+    await fetchYaraRules();
+    await checkMispUpdates();
+    await fetchSocConfigs();
+    await syncRulePolicy();
+
+    await sleep(60 * 1000);
+  }
+}
+
+main().catch((err) => {
+  console.error(`[BOOT] 💥 Critical Updater Error:`, err);
+  process.exit(1);
+});
+
+async function syncRulePolicy() {
+  try {
+    console.log(`[BOOT] 📥 Querying SOC for latest policy queues...`);
+    const versionFile = `${dataDir}/soc_rules_version.txt`;
+    let currentTopLine = '';
+    if (existsSync(versionFile)) {
+      const content = await Bun.file(versionFile).text();
+      currentTopLine = content.split('\n')[0]?.trim() || '';
+    }
+
+    const res = await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const updates = data.queues;
+
+    let targetHash = "";
+    let isQueue = false;
+    let isRollback = false;
+
+    if (updates && updates.length > 0) {
+      targetHash = updates[0].version_hash;
+      isQueue = true;
+      isRollback = updates[0].action === 'rollback';
+    } else {
+      const statusRes = await fetch(`${CENTRAL_API}/api/v1/rules/status`);
+      if (statusRes.ok) {
+        const statusData: any = await statusRes.json();
+        targetHash = statusData.current_hash;
+      }
+    }
+
+    if (targetHash && currentTopLine !== `${targetHash} used`) {
+      console.log(`[BOOT] 🔍 Checking updates... Found target patch: ${targetHash}`);
+      console.log(`[BOOT] 📥 Downloading configuration payload for patch: ${targetHash}...`);
+
+      let configUrl = `${CENTRAL_API}/api/v1/rules/configs`;
+      if (isRollback) {
+        configUrl = `${CENTRAL_API}/api/v1/rules/backup/${targetHash}`;
+      }
+
+      const configRes = await fetch(configUrl);
+      if (configRes.ok) {
+        const configData = await configRes.json();
+        const { agent_xml, manager_xml, wazuh_files } = configData;
+
+        const agentMockupPath = '/var/ossec/etc/shared/default/agent_mockup.xml';
+        const managerMockupPath = '/var/ossec/etc/manager_mockup.xml';
+
+        await Bun.write(agentMockupPath, agent_xml);
+        await applyPerm(agentMockupPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "agent_mockup.xml");
+
+        await Bun.write(managerMockupPath, manager_xml);
+        await applyPerm(managerMockupPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "manager_mockup.xml");
+
+        if (wazuh_files && Array.isArray(wazuh_files)) {
+          for (const file of wazuh_files) {
+            if (file.type === 'rule') {
+              const p = `/var/ossec/etc/rules/${file.filename}`;
+              await Bun.write(p, file.content);
+              await applyPerm(p, `${WAZUH_UID}:${WAZUH_GID}`, "660", `queued rule (${file.filename})`);
+            } else if (file.type === 'decoder') {
+              const p = `/var/ossec/etc/decoders/${file.filename}`;
+              await Bun.write(p, file.content);
+              await applyPerm(p, `${WAZUH_UID}:${WAZUH_GID}`, "660", `queued decoder (${file.filename})`);
+            }
+          }
+        }
+
+        await autoInjectWazuhConfigs({
+          mockup_manager: manager_xml ? Buffer.from(manager_xml).toString('base64') : null,
+          mockup_agent: agent_xml ? Buffer.from(agent_xml).toString('base64') : null
+        });
+
+        await Bun.write(versionFile, `${targetHash} used\n`);
+        console.log(`[BOOT] ✅ Rules applied successfully for ${targetHash}`);
+
+        await restartWazuh("SOC rules queue");
+      }
+    }
+
+    if (isQueue) {
+      await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`, {
+        method: "DELETE"
+      });
+    }
+
+  } catch (err: any) {
+    console.error(`[BOOT] ❌ [SYNC ERROR]: ${err.message}`);
+  }
+}
+async function restartWazuh(context: string) {
+  console.log(`[BOOT] 🔄 Restarting Wazuh Manager (${context})...`);
+  try {
+    const result = await $`SYSTEMD_IGNORE_CHROOT=1 systemctl restart wazuh-manager || /var/ossec/bin/wazuh-control restart`.quiet();
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.toString() || "Unknown error (exit code != 0)");
+    }
+    console.log(`[BOOT] ✅ Wazuh Manager restarted successfully.`);
+  } catch (err: any) {
+    const errMsg = err.stderr ? err.stderr.toString() : err.message;
+    console.error(`[BOOT] ❌ [CRITICAL ERROR] Failed to restart Wazuh Manager (${context})! Error: ${errMsg}`);
+
+    // Attempt to notify Central API if API_KEY and BASE_API_URL are available
+    if (BASE_API_URL && API_KEY) {
+      try {
+        await fetch(`${BASE_API_URL}/api/v1/edge-connector/error`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${API_KEY}`
+          },
+          body: JSON.stringify({ error: `Wazuh Manager restart failed: ${errMsg}`, context })
+        });
+      } catch (e) {
+        console.error(`[BOOT] ❌ Could not send error to Central API:`, e);
+      }
+    }
+  }
 }

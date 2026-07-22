@@ -35,6 +35,8 @@ services:
       - /app/node_modules
       - /run/dbus:/run/dbus
       - /run/systemd:/run/systemd
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
     env_file:
       - .env
     logging:
