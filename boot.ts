@@ -1,6 +1,6 @@
 import { spawn, exec, execFile } from "child_process";
 import { promisify } from "util";
-import { existsSync } from "fs";
+import { existsSync, readdirSync, watch } from "fs";
 import { readFile, writeFile, appendFile } from "fs/promises";
 import * as path from "path";
 import { $ } from "bun";
@@ -355,12 +355,13 @@ async function fetchSocConfigs() {
 }
 
 async function autoInjectWazuhConfigs(data: any) {
-  if (!data.mockup_agent && !data.mockup_manager) return;
   const ossecConfPath = '/var/ossec/etc/ossec.conf';
-  const agentConfPath = '/var/ossec/etc/shared/default/agent.conf';
+  const sharedDir = '/var/ossec/etc/shared';
+  const defaultAgentConfPath = path.join(sharedDir, 'default', 'agent.conf');
+
   try {
-    let managerMockup = data.mockup_manager ? Buffer.from(data.mockup_manager, 'base64').toString('utf-8') : "";
-    let agentMockup = data.mockup_agent ? Buffer.from(data.mockup_agent, 'base64').toString('utf-8') : "";
+    let managerMockup = data && data.mockup_manager ? Buffer.from(data.mockup_manager, 'base64').toString('utf-8') : "";
+    let agentMockup = data && data.mockup_agent ? Buffer.from(data.mockup_agent, 'base64').toString('utf-8') : "";
 
     if (managerMockup) {
       console.log("⚙️ Overwriting ossec.conf with central SOC mockup...");
@@ -369,8 +370,37 @@ async function autoInjectWazuhConfigs(data: any) {
     }
 
     if (agentMockup) {
-      await Bun.write(agentConfPath, agentMockup);
-      await applyPerm(agentConfPath, `${ROOT_UID}:${WAZUH_GID}`, "750", "agent.conf");
+      await Bun.write(defaultAgentConfPath, agentMockup);
+      await applyPerm(defaultAgentConfPath, `${WAZUH_UID}:${WAZUH_GID}`, "750", "agent.conf in default");
+    }
+
+    const defaultDir = path.join(sharedDir, 'default');
+    if (existsSync(defaultDir)) {
+      const defaultFiles = readdirSync(defaultDir, { withFileTypes: true });
+      if (existsSync(sharedDir)) {
+        const entries = readdirSync(sharedDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && entry.name !== 'default') {
+            for (const file of defaultFiles) {
+              if (file.isFile()) {
+                const srcPath = path.join(defaultDir, file.name);
+                const destPath = path.join(sharedDir, entry.name, file.name);
+
+                const content = await readFile(srcPath, 'utf8');
+                let destContent = "";
+                if (existsSync(destPath)) {
+                  destContent = await readFile(destPath, 'utf8');
+                }
+
+                if (content !== destContent) {
+                  await Bun.write(destPath, content);
+                  await applyPerm(destPath, `${WAZUH_UID}:${WAZUH_GID}`, "750", `${file.name} in ${entry.name}`);
+                }
+              }
+            }
+          }
+        }
+      }
     }
   } catch (err) { }
 }
@@ -401,6 +431,22 @@ async function fetchPoliciesV2() {
 async function main() {
   console.log(`[BOOT] 🚀 Updater service started. Polling every 1 minute.`);
   await detectWazuhIds();
+  await autoInjectWazuhConfigs({});
+
+  try {
+    const sharedDir = '/var/ossec/etc/shared';
+    if (existsSync(sharedDir)) {
+      watch(sharedDir, (eventType: string, filename: string | Buffer | null) => {
+        if (filename && filename.toString() !== 'default') {
+          console.log(`[BOOT] 📂 Detected change in shared groups (${eventType}: ${filename}), syncing default configs...`);
+          autoInjectWazuhConfigs({}).catch(console.error);
+        }
+      });
+      console.log(`[BOOT] 👁️ Watching ${sharedDir} for new groups...`);
+    }
+  } catch (err) {
+    console.error(`[BOOT] ❌ Failed to setup watch:`, err);
+  }
 
   while (true) {
     if (IS_LINUX && (!WAZUH_UID || !WAZUH_GID)) {
