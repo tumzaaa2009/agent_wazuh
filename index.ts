@@ -1,9 +1,30 @@
 import { $, serve } from "bun";
 import * as os from "os";
-import { exec } from "child_process";
-import { existsSync } from "fs";
+import { exec, execSync } from "child_process";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { randomBytes } from "crypto";
+import { join } from "path";
 
-//ปวดกระบาล V789////
+function getHardwareId(): string {
+  const idPath = join(import.meta.dir, ".device_id");
+  if (existsSync(idPath)) {
+    return readFileSync(idPath, "utf8").trim();
+  }
+  
+  // Generate 256-character random hex string (128 bytes = 256 hex chars)
+  const newId = randomBytes(128).toString("hex");
+  try {
+    writeFileSync(idPath, newId, "utf8");
+    console.log("🔒 Generated new 256-char Hardware ID and saved to .device_id");
+  } catch (err) {
+    console.error("⚠️ Failed to write .device_id:", err);
+  }
+  return newId;
+}
+
+const HARDWARE_ID = getHardwareId();
+
+//ปวดกระบาล uid update////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -59,7 +80,6 @@ const YARA_API_URL = process.env.YARA_API_URL || "https://rh4cloudcenter.moph.go
 
 // Master Version is maintained in agent_version.txt
 import { appendFile } from "fs/promises";
-import { existsSync } from "fs";
 
 // Override console.log and console.error to write to separate log files
 const originalConsoleLog = console.log;
@@ -142,6 +162,7 @@ async function reportMalwareEvent(eventData: {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${API_KEY}`,
+        'X-Hardware-Id': HARDWARE_ID,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
       },
       body: JSON.stringify(payload)
@@ -437,6 +458,7 @@ function connect() {
       province: PROVINCE,
       zone: ZONE,
       api_key: API_KEY,
+      hardware_id: HARDWARE_ID,
       indexer_url: INDEXER_URL,
       indexer_user: INDEXER_USER,
       indexer_password: INDEXER_PASSWORD
@@ -542,11 +564,11 @@ async function pollApiQueue() {
             });
             console.log(`🗑️ Cleared queue for ${item.srcip}`);
           }
-
+          
           // If there are more items in the queue, fetch the next batch quickly
           if (data.total_queued && data.total_queued > queues.length) {
-            console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
-            setTimeout(pollApiQueue, 2000);
+             console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
+             setTimeout(pollApiQueue, 2000);
           }
         }
       }
@@ -556,6 +578,9 @@ async function pollApiQueue() {
   }
 }
 
+
+// WebSocket connection
+connect();
 
 // HTTP API Polling fallback (every 30 seconds — WebSocket is primary)
 pollApiQueue(); // Call immediately on startup
