@@ -8,4 +8,4 @@ test.ts
 out/suricata/rules/*.rules
 suricata/log/
 suricata/logs/
-custom-soc
+.device_id

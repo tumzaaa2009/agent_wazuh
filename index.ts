@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//ปวดกระบาล V789////
+//patch update ข้อมูล cdb 270769////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -70,18 +70,6 @@ if (!existsSync(logDir)) {
   import("fs").then(fs => fs.mkdirSync(logDir, { recursive: true })).catch(() => { });
 }
 
-const LOG_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per log file
-
-async function rotateIfNeeded(filepath: string) {
-  try {
-    const file = Bun.file(filepath);
-    if (await file.exists() && file.size > LOG_MAX_BYTES) {
-      const backupPath = filepath.replace('.log', '.old.log');
-      await $`mv -f ${filepath} ${backupPath}`.quiet();
-    }
-  } catch { }
-}
-
 async function writeLog(level: "INFO" | "ERROR", ...args: any[]) {
   const msg = args.map(a => (typeof a === 'object' && a !== null) ? JSON.stringify(a) : String(a)).join(" ");
   const timestamp = new Date().toISOString();
@@ -105,9 +93,7 @@ async function writeLog(level: "INFO" | "ERROR", ...args: any[]) {
     system = "active-response";
   }
 
-  const logPath = `${logDir}/${system}.log`;
-  await rotateIfNeeded(logPath);
-  await appendFile(logPath, logStr).catch(() => { });
+  await appendFile(`${logDir}/${system}.log`, logStr).catch(() => { });
 }
 
 console.log = (...args) => { writeLog("INFO", ...args); };
@@ -159,28 +145,6 @@ async function reportMalwareEvent(eventData: {
   }
 }
 
-// ---------------------------------------------------------
-// IP Validation helper to prevent catastrophic blocks
-// ---------------------------------------------------------
-function isSafeToBlock(ip: string): boolean {
-  if (!ip || typeof ip !== "string") return false;
-  const tIp = ip.trim();
-
-  // Protect localhost
-  if (tIp === "127.0.0.1" || tIp === "::1" || tIp === "0.0.0.0" || tIp === "0.0.0.0/0") return false;
-
-  // Auto-detect: protect this machine's own IPs
-  const nets = os.networkInterfaces();
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name] || []) {
-      if (net.address === tIp) return false;
-    }
-  }
-
-  const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
-  return ipv4Regex.test(tIp);
-}
-
 async function processQueueItem(item: any, ws?: WebSocket) {
   const { id: log_id, command, srcip, timeout, agent_id, agent_name } = item;
 
@@ -195,133 +159,61 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
   if (command === "soc-firewall-drop" || command === "firewall-drop") {
     if (srcip && agent_id) {
-      if (!isSafeToBlock(srcip)) {
-        console.error(`⚠️ BLOCKED ACTION: Attempted to drop invalid/unsafe IP: ${srcip}. Ignored.`);
-
-        // Send ACK back so SOC knows it was rejected
-        if (ws) {
-          const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "rejected", reason: "Unsafe IP", log_id };
-          ws.send(JSON.stringify(ackMsg));
-        }
-        fetch(`${API_BASE_URL}/active-response/success`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ log_id, hospital_code: HOSPITAL_CODE, status: "rejected_unsafe_ip" })
-        }).catch(err => console.error("Failed to send reject ACK:", err));
-
-        return;
-      }
-
       const dropMsg = `🛡️ Requesting Firewall Drop for IP ${srcip} on Agent ${agent_id} (${agent_name || 'unknown'}) with timeout ${timeout || 3600}s`;
       console.log(dropMsg);
       // ส่งเข้า syslog
       await $`logger -t HOS-Edge-Connector ${dropMsg}`.catch((err: any) => console.error("Syslog error:", err));
 
       try {
-        // Detect OS dynamically
-        let isWindows = false;
-        let isUbuntu = false;
-        let isCentosAlma = false;
-
         if (agent_id === "000") {
-          try {
-            const osRelease = await Bun.file('/etc/os-release').text();
-            const osLower = osRelease.toLowerCase();
-            if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
-            else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
-          } catch (e) { }
-        } else {
-          try {
-            const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
-            const osLine = infoOutput.split('\n').find((l: string) => l.toLowerCase().includes('operating system:'));
-            if (osLine) {
-              const osLower = osLine.toLowerCase();
-              if (osLower.includes('windows')) isWindows = true;
-              else if (osLower.includes('ubuntu') || osLower.includes('debian')) isUbuntu = true;
-              else if (osLower.includes('centos') || osLower.includes('alma') || osLower.includes('rocky') || osLower.includes('rhel')) isCentosAlma = true;
+          // 1. Local Agent (000): Execute the Active Response binary directly with JSON payload
+          let executable = "/var/ossec/active-response/bin/firewall-drop";
+          if (existsSync("/var/ossec/active-response/bin/firewalld-drop")) {
+             executable = "/var/ossec/active-response/bin/firewalld-drop";
+          }
+          
+          const arPayload = JSON.stringify({
+            version: 1,
+            origin: { name: "edge-connector", module: "active-response" },
+            command: "add",
+            parameters: {
+              extra_args: [],
+              alert: { data: { srcip: srcip } },
+              program: executable.replace("/var/ossec/", "")
             }
-          } catch (e) { }
-        }
+          });
 
-        if (agent_id === "000") {
-          // 1. Local Manager (Agent 000)
-          let arScript = '/var/ossec/active-response/bin/firewall-drop';
-          if (isUbuntu) arScript = '/var/ossec/active-response/bin/firewall-drop';
-          else if (isCentosAlma) arScript = '/var/ossec/active-response/bin/firewalld-drop';
-
+          console.log(`🚀 Executing local AR: ${executable} with payload: ${arPayload}`);
+          
           try {
-            console.log(`🚀 Executing local ${arScript} to block ${srcip}`);
-            const child = Bun.spawn([arScript], {
-              stdin: 'pipe',
-              stdout: 'pipe',
-              stderr: 'pipe'
-            });
-
-            // Write initial ADD message
-            const addMsg = JSON.stringify({
-              command: "add",
-              parameters: {
-                extra_args: [],
-                alert: { data: { srcip: srcip } },
-                program: "active-response/bin/firewall-drop"
-              }
-            });
-            child.stdin.write(addMsg + "\n");
+            const child = Bun.spawn([executable], { stdin: "pipe" });
+            child.stdin.write(arPayload);
             child.stdin.flush();
-
-            // We need to read stdout to consume the continue request
-            (async () => {
-              try {
-                const reader = child.stdout.getReader();
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-                  const output = new TextDecoder().decode(value);
-                  if (output.includes('"command":"continue"')) {
-                    const continueMsg = JSON.stringify({
-                      command: "continue",
-                      parameters: { keys: [srcip] }
-                    });
-                    child.stdin.write(continueMsg + "\n");
-                    child.stdin.flush();
-                    child.stdin.end();
-                    break;
-                  }
-                }
-              } catch (e) {
-                console.error("Error reading AR stdout:", e);
-              }
-            })();
-
+            child.stdin.end();
             await child.exited;
             console.log(`✅ Successfully executed local block for ${srcip}`);
           } catch (spawnErr) {
             console.error(`❌ Failed to spawn local AR script:`, spawnErr);
           }
         } else {
-          // 2. Remote Agent (Agent 001+)
-          let arName = 'firewall-drop';
-          try {
-            const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
-            if (isWindows) {
-              const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
-              arName = match ? match[1] : 'netsh';
-            } else if (isCentosAlma) {
-              const match = arOutput.match(/Response name: (firewalld?-drop\d*)/);
-              arName = match ? match[1] : 'firewalld-drop';
-            } else {
-              const match = arOutput.match(/Response name: (firewall-drop\d*|host-deny\d*)/);
-              arName = match ? match[1] : 'firewall-drop';
-            }
-          } catch (e) {
-            if (isWindows) arName = 'netsh';
-            else if (isCentosAlma) arName = 'firewalld-drop';
-            else arName = 'firewall-drop';
+          // 2. Remote Agent (Agent 001+): Use agent_control to push AR over the network
+          // Detect agent OS first
+          const infoOutput = await $`/var/ossec/bin/agent_control -i ${agent_id}`.text();
+          const isWindows = infoOutput.toLowerCase().includes('windows');
+
+          const arOutput = await $`/var/ossec/bin/agent_control -L`.text();
+
+          let arName = 'firewalld-drop';
+          if (isWindows) {
+            const match = arOutput.match(/Response name: (netsh\d*|win_route-null\d*)/);
+            arName = match ? match[1] : 'netsh';
+          } else {
+            const match = arOutput.match(/Response name: ((?:firewalld?-drop|host-deny)\d*)/);
+            arName = match ? match[1] : 'firewalld-drop';
           }
 
-          console.log(`🚀 Triggering ${arName} on remote agent ${agent_id} (${isWindows ? 'Windows' : (isUbuntu ? 'Ubuntu' : 'CentOS/Linux')}) to block ${srcip}`);
           await $`/var/ossec/bin/agent_control -b ${srcip} -f ${arName} -u ${agent_id}`;
-          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id}`);
+          console.log(`✅ Successfully triggered ${arName} on remote agent ${agent_id} to block ${srcip}`);
         }
       } catch (err) {
         console.error(`❌ Failed to trigger active response via agent_control:`, err);
@@ -464,14 +356,12 @@ function connect() {
 
       // Handle rule policy update action
       if (data.action === "update_policy") {
-        console.log("📥 Received update_policy trigger from Central SOC");
-        await syncRulePolicy();
+        console.log("📥 Received update_policy trigger from Central SOC. (Delegated to boot.ts polling loop)");
       }
 
       // Handle threat intel sync
       if (data.action === "SYNC_THREAT_INTEL") {
-        console.log("📥 Received SYNC_THREAT_INTEL trigger from Central SOC");
-        await downloadMispCdb();
+        console.log("📥 Received SYNC_THREAT_INTEL trigger from Central SOC. (Delegated to boot.ts polling loop)");
       }
 
       // Handle agent patch update action
@@ -480,7 +370,7 @@ function connect() {
         console.log("🔄 Deleting agent_version.txt to force edge-updater to pull new version...");
         try {
           if (existsSync(`${import.meta.dir}/agent_version.txt`)) {
-            await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
+              await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
           }
         } catch (e) {
           console.error("❌ Failed to delete agent_version.txt:", e);
@@ -488,11 +378,19 @@ function connect() {
       }
 
       // 2. Handle new Array payload format (if pushed via WS)
-      if (Array.isArray(data) && data[0]?.success && data[0]?.queues) {
-        const queues = data[0].queues;
-        console.log(`📥 Processing ${queues.length} queue items from WS array`);
-        for (const item of queues) {
-          await processQueueItem(item, ws);
+      if (Array.isArray(data)) {
+        let queues: any[] = [];
+        if (data[0]?.success && data[0]?.queues) {
+          queues = data[0].queues;
+        } else if (data.length > 0 && (data[0]?.id || data[0]?.command)) {
+          queues = data;
+        }
+        
+        if (queues.length > 0) {
+          console.log(`📥 Processing ${queues.length} queue items from WS array`);
+          for (const item of queues) {
+            await processQueueItem(item, ws);
+          }
         }
       }
 
@@ -512,13 +410,8 @@ function connect() {
   };
 }
 
-
-
-// ---------------------------------------------------------
-// HTTP Polling Flow (Pull-based API) - Optional
-// ---------------------------------------------------------
 async function pollApiQueue() {
-  const API_QUEUE_URL = process.env.API_QUEUE_URL || `${WS_URL.replace("wss://", "https://").replace("ws://", "http://").replace("/ws/active-response", "")}/api/v1/active-response/queues`;
+  const API_QUEUE_URL = process.env.API_QUEUE_URL || "https://rh4cloudcenter.moph.go.th/api/v1/active-response/queues";
 
   try {
     const response = await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}`, {
@@ -528,26 +421,29 @@ async function pollApiQueue() {
 
     if (response.ok) {
       const data = await response.json();
-      if (data && data.success && Array.isArray(data.queues)) {
-        const queues = data.queues;
-        if (queues.length > 0) {
-          console.log(`🔄 Polled ${queues.length} items from API`);
-          for (const item of queues) {
-            await processQueueItem(item);
+      let queues: any[] = [];
+      
+      if (Array.isArray(data)) {
+        if (data[0]?.success && data[0]?.queues) {
+          queues = data[0].queues;
+        } else if (data.length > 0 && (data[0]?.id || data[0]?.command)) {
+          queues = data;
+        }
+      } else if (data?.success && data?.queues) {
+        queues = data.queues;
+      }
 
-            // Note: After processing, you should call DELETE API to clear the queue
-            await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}&srcip=${item.srcip}`, {
-              method: "DELETE",
-              headers: { "Authorization": `Bearer ${API_KEY}` }
-            });
-            console.log(`🗑️ Cleared queue for ${item.srcip}`);
-          }
-          
-          // If there are more items in the queue, fetch the next batch quickly
-          if (data.total_queued && data.total_queued > queues.length) {
-             console.log(`⏩ More items remaining (${data.total_queued} total), fetching next batch...`);
-             setTimeout(pollApiQueue, 2000);
-          }
+      if (queues.length > 0) {
+        console.log(`🔄 Polled ${queues.length} items from API`);
+        for (const item of queues) {
+          await processQueueItem(item);
+
+          // Note: After processing, you should call DELETE API to clear the queue
+          await fetch(`${API_QUEUE_URL}?hospital_code=${HOSPITAL_CODE}&srcip=${item.srcip}`, {
+            method: "DELETE",
+            headers: { "Authorization": `Bearer ${API_KEY}` }
+          });
+          console.log(`🗑️ Cleared queue for ${item.srcip}`);
         }
       }
     }
@@ -556,12 +452,11 @@ async function pollApiQueue() {
   }
 }
 
+// Start WebSocket connection
+connect();
 
-// HTTP API Polling fallback (every 30 seconds — WebSocket is primary)
-pollApiQueue(); // Call immediately on startup
-setInterval(pollApiQueue, 30 * 1000);
-
-
+// Enable HTTP API Polling every 10 seconds
+setInterval(pollApiQueue, 10000);
 
 // ---------------------------------------------------------
 // Master Server API (Only runs if IS_MASTER=true)

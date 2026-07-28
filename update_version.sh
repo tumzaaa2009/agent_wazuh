@@ -1,35 +1,19 @@
 #!/bin/bash
+LOG_FILE="/var/hos-edge-connector/logs/boots.log"
+TIMESTAMP=$(date +"%Y-%m-%dT%H:%M:%S%z")
 
-if [ -z "$1" ]; then
-  echo "Usage: ./update_version.sh <new_version>"
-  echo "Example: ./update_version.sh 1.0.1"
-  exit 1
+echo "==================== UPDATE START: $TIMESTAMP ====================" >> "$LOG_FILE"
+echo "🚀 Building and updating Docker containers safely..." | tee -a "$LOG_FILE"
+
+docker compose up -d 2>&1 | tee -a "$LOG_FILE"
+
+echo "✅ Container updated successfully." | tee -a "$LOG_FILE"
+
+echo "🔄 Restarting Wazuh Manager..." | tee -a "$LOG_FILE"
+if systemctl restart wazuh-manager >> "$LOG_FILE" 2>&1; then
+    echo "✅ Wazuh Manager restarted successfully." | tee -a "$LOG_FILE"
+else
+    echo "❌ Failed to restart Wazuh Manager." | tee -a "$LOG_FILE"
 fi
 
-NEW_VERSION=$1
-
-echo "Updating version to $NEW_VERSION..."
-
-# Update version.txt
-echo "$NEW_VERSION" > version.txt
-
-# Update index.ts
-sed -i "s/const EDGE_VERSION = \".*\";/const EDGE_VERSION = \"$NEW_VERSION\";/" index.ts
-
-echo "Building and restarting Docker container..."
-# 1. หยุด Container ที่รันอยู่
-docker compose down 
-
-# 2. เคลียร์ขยะและลบ Image เก่าที่ไม่ได้ใช้งานทั้งหมด (บังคับลบด้วย -f)
-echo "Cleaning up old docker images..."
-docker system prune -a -f
-
-# 3. สั่ง Build ใหม่โดยไม่ใช้ Cache เก่า
-echo "Rebuilding completely fresh..."
-docker compose build --no-cache
-
-# 4. เริ่มต้น Container ใหม่
-docker compose up -d
-
-echo "✅ Version updated to $NEW_VERSION and container restarted."
-echo "Master API is now serving the new version."
+echo "==================== UPDATE END: $TIMESTAMP ====================" >> "$LOG_FILE"

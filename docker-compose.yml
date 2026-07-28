@@ -29,12 +29,20 @@ services:
     container_name: hospital-edge-updater
     command: ["bun", "run", "boot.ts"]
     restart: unless-stopped
+    network_mode: "host"
+    pid: "host"
+    privileged: true
     volumes:
       - /var/ossec:/var/ossec
       - ./:/app
       - /app/node_modules
       - /run/dbus:/run/dbus
       - /run/systemd:/run/systemd
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      - ./logs:/logs
+    environment:
+      - LOG_DIR=/logs
     env_file:
       - .env
     logging:

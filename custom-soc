@@ -1,6 +1,7 @@
 #!/var/ossec/framework/python/bin/python3
 
 import sys
+import os
 import json
 import re
 import requests
@@ -9,15 +10,25 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ============================================================================
-# Load .env ปวดกระบาล V10
+# Load .env อัพเดท lv รับตั้งแต่ lv 3 ignore id
 # ============================================================================
 
 ENV_FILE = "/var/hos-edge-connector/.env"
 
 
 def write_log(message):
-    with open("/var/ossec/logs/integrations.log", "a") as log:
-        log.write(f"{message}\n")
+    log_path = "/var/ossec/logs/integrations.log"
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 10 * 1024 * 1024:
+            os.rename(log_path, f"{log_path}.1")
+    except Exception:
+        pass
+    try:
+        with open(log_path, "a") as log:
+            log.write(f"{message}\n")
+    except Exception:
+        pass
+
 
 
 def load_env(path):
@@ -74,10 +85,35 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
-if API_KEY:
-    write_log("[custom-soc] Configuration loaded")
-else:
+if not API_KEY:
     write_log("[custom-soc] ERROR: API_KEY missing from .env")
+
+
+# ============================================================================
+# Excluded Rule IDs (rule id ที่ไม่ต้องการส่งขึ้น API)
+# เพิ่ม rule id ใหม่ในลิสต์นี้ได้เลย เช่น "550", "551", "5501"
+# หรือจะกำหนดผ่าน .env ด้วย key EXCLUDED_RULE_IDS (คั่นด้วย comma) ก็ได้
+# เช่นใน .env: EXCLUDED_RULE_IDS=550,551,100100
+# ============================================================================
+
+EXCLUDED_RULE_IDS = {
+    "550",
+    "554",
+    "594",
+    "597",
+    "598",
+    "750",
+    "751",
+    "752",
+    "120063",
+    "92200",
+}
+
+_env_excluded = env.get("EXCLUDED_RULE_IDS", "")
+if _env_excluded:
+    EXCLUDED_RULE_IDS.update(
+        rid.strip() for rid in _env_excluded.split(",") if rid.strip()
+    )
 
 
 # ============================================================================
@@ -200,8 +236,6 @@ def main():
 
     alert_file = sys.argv[1]
 
-    write_log(f"[custom-soc] Triggered: {alert_file}")
-
     try:
 
         with open(alert_file, "r") as f:
@@ -217,9 +251,12 @@ def main():
     rule = alert.get("rule", {})
 
     level = int(rule.get("level", 0))
-    rule_id = rule.get("id", "")
+    rule_id = str(rule.get("id", ""))
     description = rule.get("description", "")
     groups = rule.get("groups", [])
+
+    if rule_id in EXCLUDED_RULE_IDS or "syscheck_registry" in groups:
+        return
 
     full_log = alert.get("full_log", "")
 
@@ -231,7 +268,7 @@ def main():
     ):
         report_malware_event(alert, full_log)
 
-    if level >= 6:
+    if level >= 3:
 
         payload = alert.copy()
 
@@ -239,11 +276,6 @@ def main():
         payload["hospital_name"] = HOSPITAL_NAME
 
         try:
-
-            write_log(
-                f"[custom-soc] Sending alert (rule={rule_id}, level={level})"
-            )
-
             r = requests.post(
                 API_URL,
                 json=payload,
@@ -253,13 +285,12 @@ def main():
             )
 
             if r.status_code == 200:
-                write_log("[custom-soc] HTTP 200 OK")
+                write_log(f"[custom-soc] rule={rule_id} level={level} -> HTTP 200 OK")
             else:
-                write_log(f"[custom-soc] HTTP {r.status_code}")
-                write_log(f"[custom-soc] {r.text}")
+                write_log(f"[custom-soc] rule={rule_id} level={level} -> HTTP {r.status_code}: {r.text}")
 
         except Exception as e:
-            write_log(f"[custom-soc] ERROR: {e}")
+            write_log(f"[custom-soc] ERROR rule={rule_id}: {e}")
 
 
 if __name__ == "__main__":
