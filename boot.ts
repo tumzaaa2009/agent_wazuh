@@ -1,6 +1,7 @@
 import { spawn, exec, execFile } from "child_process";
+import { randomUUID } from "crypto";
 import { promisify } from "util";
-import { existsSync, readdirSync, watch } from "fs";
+import { existsSync, readdirSync, watch, readFileSync, writeFileSync } from "fs";
 import { readFile, writeFile, appendFile, chown, chmod, stat } from "fs/promises";
 import * as path from "path";
 import { $ } from "bun";
@@ -21,6 +22,26 @@ let WAZUH_UID = process.env.WAZUH_UID || "";
 let WAZUH_GID = process.env.WAZUH_GID || "";
 const ROOT_UID = process.env.ROOT_UID || "0";
 const IS_LINUX = process.platform === "linux";
+
+const deviceIdPath = "/app/.device_id";
+let DEVICE_ID = "";
+try {
+  if (existsSync(deviceIdPath)) {
+    DEVICE_ID = readFileSync(deviceIdPath, "utf-8").trim();
+  } else {
+    DEVICE_ID = require("crypto").randomBytes(128).toString("hex");
+    writeFileSync(deviceIdPath, DEVICE_ID, "utf-8");
+  }
+} catch (e) {
+  console.error("Error generating .device_id", e);
+}
+
+async function authFetch(url: string, options: any = {}) {
+  const headers: any = { ...options.headers };
+  headers["x-hardware-id"] = DEVICE_ID;
+  if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`;
+  return fetch(url, { ...options, headers });
+}
 
 const LOG_DIR = process.env.LOG_DIR || "/logs";
 const LOG_FILE = path.join(LOG_DIR, "boots.log");
@@ -179,7 +200,7 @@ async function applyPerm(filepath: string, owner: string, mode: string, label: s
 async function checkAndApplyUpdate(): Promise<boolean> {
   try {
     await bootLog(`[BOOT] 📥 Checking for edge connector updates...`);
-    const res = await fetch(`${CENTRAL_API}/api/v1/edge-connector/version`);
+    const res = await authFetch(`${CENTRAL_API}/api/v1/edge-connector/version`);
     if (res.ok) {
       const data = await res.json();
       let localVersion = "";
@@ -190,7 +211,7 @@ async function checkAndApplyUpdate(): Promise<boolean> {
       if (data.success && data.version && data.version !== localVersion) {
         await bootLog(`[BOOT] 🚀 New version detected! Remote: ${data.version}, Local: ${localVersion}`);
         await bootLog(`[BOOT] 📥 Downloading new index.ts...`);
-        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/edge-connector/script`);
+        const scriptRes = await authFetch(`${CENTRAL_API}/api/v1/edge-connector/script`);
         if (scriptRes.ok) {
           const scriptText = await scriptRes.text();
           await writeFile(scriptFile, scriptText);
@@ -243,12 +264,12 @@ async function checkCustomSocUpdate(): Promise<boolean> {
     }
 
     await bootLog(`[BOOT] 📥 Querying API for latest Custom SOC patches...`);
-    const res = await fetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
+    const res = await authFetch(`${CENTRAL_API}/api/v1/custom-soc/version`);
     if (res.ok) {
       const data = await res.json();
       if (data.success && data.version && data.version !== localVersion) {
         await bootLog(`[BOOT] 🚀 [UPDATE] Custom SOC check! Remote: ${data.version}, Local: ${localVersion}.`);
-        const scriptRes = await fetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
+        const scriptRes = await authFetch(`${CENTRAL_API}/api/v1/custom-soc/script`);
         if (scriptRes.ok) {
           const scriptText = await scriptRes.text();
           await $`rm -f ${scriptFileSOC}`.quiet().catch((e) => bootLog(`[PERM] ❌ rm failed on ${scriptFileSOC}: ${e.stderr?.toString() || e.message}`, true));
@@ -274,7 +295,7 @@ async function fetchYaraRules(): Promise<boolean> {
     await bootLog(`[BOOT] 📥 Checking YARA rules version...`);
     const RULES_PATH = "/var/ossec/etc/shared/default/yara_rules.yar";
     try {
-      const versionRes = await fetch(`${YARA_API_URL}/version`, { signal: AbortSignal.timeout(5000) });
+      const versionRes = await authFetch(`${YARA_API_URL}/version`, { signal: AbortSignal.timeout(5000) });
       if (versionRes.ok) {
         const vData = await versionRes.json();
         const versionFile = `${dataDir}/yara_rules_version.txt`;
@@ -283,7 +304,7 @@ async function fetchYaraRules(): Promise<boolean> {
           let localVersion = content.split('\n')[0].trim().replace(" used", "");
           if (localVersion === String(vData.version)) return false;
         }
-        const response = await fetch(YARA_API_URL);
+        const response = await authFetch(YARA_API_URL);
         if (response.ok) {
           const data = await response.json();
           if (data.success && data.rules) {
@@ -340,7 +361,7 @@ async function ensureWazuhTimeouts(): Promise<boolean> {
 async function checkMispUpdates(): Promise<boolean> {
   try {
     await bootLog(`[BOOT] 📥 Checking for MISP updates...`);
-    const res = await fetch(`${BASE_API_URL}/api/v1/threat-intel/misp-version`, {
+    const res = await authFetch(`${BASE_API_URL}/api/v1/threat-intel/misp-version`, {
       headers: { "Authorization": `Bearer ${API_KEY}` }
     });
     if (res.ok) {
@@ -366,7 +387,7 @@ async function checkMispUpdates(): Promise<boolean> {
         let hasChanges = false;
         exec(`mkdir -p /var/ossec/etc/lists`);
         for (const { url, file } of types) {
-          const r = await fetch(`${BASE_API_URL}/api/v1/threat-intel/${url}`, { headers: { "Authorization": `Bearer ${API_KEY}` } });
+          const r = await authFetch(`${BASE_API_URL}/api/v1/threat-intel/${url}`, { headers: { "Authorization": `Bearer ${API_KEY}` } });
           if (r.ok) {
             const content = await r.text();
             const filepath = `/var/ossec/etc/lists/${file}`;
@@ -394,7 +415,7 @@ async function checkMispUpdates(): Promise<boolean> {
 async function fetchSocConfigs(): Promise<boolean> {
   try {
     await bootLog(`[BOOT] 📥 Checking for SOC configs updates...`);
-    const versionRes = await fetch(`${SOC_CONFIG_URL}/version`);
+    const versionRes = await authFetch(`${SOC_CONFIG_URL}/version`);
     if (versionRes.ok) {
       const vData = await versionRes.json();
       if (vData.success && vData.version) {
@@ -405,7 +426,7 @@ async function fetchSocConfigs(): Promise<boolean> {
           if (localVersion === remoteVersion || localVersion === `${remoteVersion} used`) return false;
         }
         await bootLog(`[BOOT] 📥 Updates found! Fetching latest SOC configs...`);
-        const response = await fetch(SOC_CONFIG_URL);
+        const response = await authFetch(SOC_CONFIG_URL);
         if (response.ok) {
           const data = await response.json();
           if (data.success) {
@@ -495,7 +516,7 @@ async function fetchPoliciesV2(): Promise<boolean> {
   const API_BASE_V2 = process.env.API_URL_V2 || "https://rh4cloudcenter.moph.go.th/api/v2";
   try {
     await bootLog(`[BOOT] 📥 Checking for OpenXDR Policy updates...`);
-    const response = await fetch(`${API_BASE_V2}/policies/${HOSPITAL_CODE}`, {
+    const response = await authFetch(`${API_BASE_V2}/policies/${HOSPITAL_CODE}`, {
       method: "GET",
       headers: { "Authorization": `Bearer ${API_KEY}` }
     });
@@ -703,7 +724,7 @@ async function syncRulePolicy(): Promise<boolean> {
       currentTopLine = content.split('\n')[0]?.trim() || '';
     }
 
-    const res = await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
+    const res = await authFetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`);
     if (!res.ok) return false;
     const data = await res.json();
     const updates = data.queues;
@@ -717,7 +738,7 @@ async function syncRulePolicy(): Promise<boolean> {
       isQueue = true;
       isRollback = updates[0].action === 'rollback';
     } else {
-      const statusRes = await fetch(`${CENTRAL_API}/api/v1/rules/status`);
+      const statusRes = await authFetch(`${CENTRAL_API}/api/v1/rules/status`);
       if (statusRes.ok) {
         const statusData: any = await statusRes.json();
         targetHash = statusData.current_hash;
@@ -733,7 +754,7 @@ async function syncRulePolicy(): Promise<boolean> {
         configUrl = `${CENTRAL_API}/api/v1/rules/backup/${targetHash}`;
       }
 
-      const configRes = await fetch(configUrl);
+      const configRes = await authFetch(configUrl);
       if (configRes.ok) {
         const configData = await configRes.json();
         const { agent_xml, manager_xml, wazuh_files } = configData;
@@ -771,7 +792,7 @@ async function syncRulePolicy(): Promise<boolean> {
         await bootLog(`[BOOT] ✅ Rules applied successfully for ${targetHash}`);
 
         if (isQueue) {
-          await fetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`, {
+          await authFetch(`${CENTRAL_API}/api/v1/rules/queues?hospital_code=${HOSPITAL_CODE}`, {
             method: "DELETE"
           });
         }

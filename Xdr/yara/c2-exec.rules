@@ -1,0 +1,37 @@
+# /etc/audit/rules.d/c2-exec.rules
+#
+# Purpose: catch actual EXECUTION from world-writable drop zones.
+# This is the real C2 / dropper signal - much cheaper than FIM hashing
+# every write in /tmp, /var/tmp, /dev/shm, and catches extensionless
+# binaries that a filename-based FIM restrict pattern would miss.
+#
+# Install:
+#   cp c2-exec.rules /etc/audit/rules.d/
+#   augenrules --load
+#   systemctl restart auditd
+#
+# Wazuh reads these via the <localfile log_format="audit"> block already
+# added to the agent config, so alerts flow into the same pipeline.
+
+-D
+-b 8192
+
+# 64-bit execve calls where the executed binary resides in a drop zone
+-a always,exit -F arch=b64 -S execve -F dir=/tmp -F perm=x -k c2_exec_dropzone
+-a always,exit -F arch=b64 -S execve -F dir=/var/tmp -F perm=x -k c2_exec_dropzone
+-a always,exit -F arch=b64 -S execve -F dir=/dev/shm -F perm=x -k c2_exec_dropzone
+
+# 32-bit compat (some droppers ship 32-bit binaries on 64-bit hosts)
+-a always,exit -F arch=b32 -S execve -F dir=/tmp -F perm=x -k c2_exec_dropzone
+-a always,exit -F arch=b32 -S execve -F dir=/var/tmp -F perm=x -k c2_exec_dropzone
+-a always,exit -F arch=b32 -S execve -F dir=/dev/shm -F perm=x -k c2_exec_dropzone
+
+# Optional but recommended: catch LD_PRELOAD / LD_LIBRARY_PATH being set
+# at exec time (common technique to load a malicious shared object
+# without touching a monitored file directly)
+-a always,exit -F arch=b64 -S execve -F key=exec_env_watch
+
+# Make rules immutable for this boot (prevents an attacker with root
+# from silently disabling auditd rules mid-session; requires reboot to
+# change further). Comment out if this breaks your ops workflow.
+# -e 2

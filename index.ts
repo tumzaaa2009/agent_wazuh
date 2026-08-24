@@ -3,7 +3,7 @@ import * as os from "os";
 import { exec } from "child_process";
 import { existsSync } from "fs";
 
-//patch update ข้อมูล cdb 270769////
+//patch update update telegram update .device_id////
 
 // --- 0. Set System Timezone (Asia/Bangkok) ---
 function setSystemTimezone() {
@@ -45,7 +45,7 @@ function getWazuhLogTimestamp() {
   return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "141";
+const HOSPITAL_CODE = process.env.HOSPITAL_CODE || "";
 const WS_URL = process.env.WS_URL || "wss://rh4cloudcenter.moph.go.th/ws/active-response";
 const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "";
 const PROVINCE = process.env.PROVINCE || "";
@@ -169,9 +169,9 @@ async function processQueueItem(item: any, ws?: WebSocket) {
           // 1. Local Agent (000): Execute the Active Response binary directly with JSON payload
           let executable = "/var/ossec/active-response/bin/firewall-drop";
           if (existsSync("/var/ossec/active-response/bin/firewalld-drop")) {
-             executable = "/var/ossec/active-response/bin/firewalld-drop";
+            executable = "/var/ossec/active-response/bin/firewalld-drop";
           }
-          
+
           const arPayload = JSON.stringify({
             version: 1,
             origin: { name: "edge-connector", module: "active-response" },
@@ -184,7 +184,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
           });
 
           console.log(`🚀 Executing local AR: ${executable} with payload: ${arPayload}`);
-          
+
           try {
             const child = Bun.spawn([executable], { stdin: "pipe" });
             child.stdin.write(arPayload);
@@ -221,7 +221,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
       // Send ACK back if WebSocket is provided
       if (ws) {
-        const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id };
+        const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, hardware_id: await getHardwareId(), status: "success", log_id };
         ws.send(JSON.stringify(ackMsg));
       }
 
@@ -293,7 +293,7 @@ async function processQueueItem(item: any, ws?: WebSocket) {
 
         // Send ACK back if WebSocket is provided
         if (ws) {
-          const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, status: "success", log_id, scan_result: yaraOutput };
+          const ackMsg = { type: "ack", hospital_code: HOSPITAL_CODE, hardware_id: await getHardwareId(), status: "success", log_id, scan_result: yaraOutput };
           ws.send(JSON.stringify(ackMsg));
         }
 
@@ -319,12 +319,14 @@ function connect() {
   console.log(`🔗 Connecting to Central SOC WebSocket at ${WS_URL}...`);
   const ws = new WebSocket(WS_URL);
 
-  ws.onopen = () => {
+  ws.onopen = async () => {
     console.log("✅ Connected to Central SOC WebSocket!");
 
     const registerMsg = {
       type: "register",
       hospital_code: HOSPITAL_CODE,
+      hardware_id: await getHardwareId(),
+      device_id: await getHardwareId(),
       hospital_name: HOSPITAL_NAME,
       province: PROVINCE,
       zone: ZONE,
@@ -370,7 +372,7 @@ function connect() {
         console.log("🔄 Deleting agent_version.txt to force edge-updater to pull new version...");
         try {
           if (existsSync(`${import.meta.dir}/agent_version.txt`)) {
-              await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
+            await Bun.file(`${import.meta.dir}/agent_version.txt`).delete();
           }
         } catch (e) {
           console.error("❌ Failed to delete agent_version.txt:", e);
@@ -385,7 +387,7 @@ function connect() {
         } else if (data.length > 0 && (data[0]?.id || data[0]?.command)) {
           queues = data;
         }
-        
+
         if (queues.length > 0) {
           console.log(`📥 Processing ${queues.length} queue items from WS array`);
           for (const item of queues) {
@@ -422,7 +424,7 @@ async function pollApiQueue() {
     if (response.ok) {
       const data = await response.json();
       let queues: any[] = [];
-      
+
       if (Array.isArray(data)) {
         if (data[0]?.success && data[0]?.queues) {
           queues = data[0].queues;
@@ -495,3 +497,206 @@ if (process.env.IS_MASTER === "true") {
     }
   });
 }
+
+// ---------------------------------------------------------
+// SOC Watchdog — Monitor integrations.log & alert Telegram
+// Case 1: No HTTP 200 OK for 30 minutes
+// Case 2: ERROR / 502 / Read timed out detected
+// ---------------------------------------------------------
+
+const WATCHDOG_BOT_TOKEN = "8185344494:AAG3-DKdv_TH8OmHor9dEjedgoMfd6pAp5M";
+const WATCHDOG_CHAT_ID = "8169792272";
+const WATCHDOG_LOG_FILE = "/var/ossec/logs/integrations.log";
+const WATCHDOG_STATE_FILE = "/var/ossec/logs/.soc-watchdog-state.json";
+const WATCHDOG_NO200_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+const WATCHDOG_DEDUP_WINDOW_MS = 30 * 60 * 1000;    // 30 minutes
+const WATCHDOG_CHECK_INTERVAL_MS = 5 * 60 * 1000;   // every 5 minutes
+
+interface WatchdogState {
+  [key: string]: number;
+}
+
+async function loadWatchdogState(): Promise<WatchdogState> {
+  try {
+    const file = Bun.file(WATCHDOG_STATE_FILE);
+    if (await file.exists()) {
+      return await file.json();
+    }
+  } catch { }
+  return {};
+}
+
+async function saveWatchdogState(state: WatchdogState) {
+  try {
+    await Bun.write(WATCHDOG_STATE_FILE, JSON.stringify(state));
+  } catch { }
+}
+
+async function sendTelegramAlert(message: string) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${WATCHDOG_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: WATCHDOG_CHAT_ID,
+        text: message,
+        parse_mode: "HTML",
+      }),
+    });
+    if (!res.ok) {
+      console.error(`[soc-watchdog] Telegram API error: ${res.status}`);
+    }
+  } catch (err) {
+    console.error(`[soc-watchdog] Telegram send failed:`, err);
+  }
+}
+
+async function getOsType(): Promise<string> {
+  try {
+    const content = await Bun.file("/etc/os-release").text();
+    const idMatch = content.match(/^ID="?([^"\n]*)"?$/m);
+    const idLikeMatch = content.match(/^ID_LIKE="?([^"\n]*)"?$/m);
+    const id = idMatch ? idMatch[1].trim() : "";
+    const idLike = idLikeMatch ? idLikeMatch[1].trim() : "";
+    return [id, idLike].filter(Boolean).join(" / ") || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+async function getHardwareId(): Promise<string> {
+  const paths = [
+    "/var/hos-edge-connector/.device_id",
+    "/app/.device_id",
+    `${import.meta.dir}/.device_id`,
+    "./.device_id"
+  ];
+  for (const p of paths) {
+    try {
+      const file = Bun.file(p);
+      if (await file.exists()) {
+        const hwid = await file.text();
+        if (hwid.trim()) return hwid.trim();
+      }
+    } catch {}
+  }
+  return "unknown";
+}
+
+async function runSocWatchdog() {
+  const now = Date.now();
+  const state = await loadWatchdogState();
+
+  // Read log file
+  let lines: string[] = [];
+  try {
+    const file = Bun.file(WATCHDOG_LOG_FILE);
+    if (!(await file.exists())) return;
+    const content = await file.text();
+    lines = content.split("\n");
+  } catch {
+    return;
+  }
+
+  const fileMtime = Date.now(); // approximate: we just read it
+
+  // Scan for last HTTP 200 and errors
+  let last200Time = 0;
+  const errors = new Set<string>();
+  let lastErrorRawLine = "";
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    let lineTime = 0;
+    const timeMatch = line.match(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/);
+    if (timeMatch) {
+      lineTime = new Date(timeMatch[1].replace(' ', 'T') + '+07:00').getTime();
+    }
+
+    if (line.includes("[custom-soc]") || line.includes("[malware-event]")) {
+      // Check for success (HTTP 200)
+      if (line.includes("200") || line.includes("HTTP 200")) {
+        if (lineTime > 0) last200Time = lineTime;
+      }
+
+      // Check for errors (only if within the check interval, e.g., last 5 minutes)
+      if (lineTime > 0 && now - lineTime <= WATCHDOG_CHECK_INTERVAL_MS) {
+        if (line.includes("HTTP 502") || line.includes("502 Bad Gateway") || line.includes("502")) {
+          errors.add("502_bad_gateway");
+          lastErrorRawLine = line;
+        } else if (line.includes("Read timed out")) {
+          errors.add("read_timeout");
+          lastErrorRawLine = line;
+        } else if (line.includes("Connection refused")) {
+          errors.add("connection_refused");
+          lastErrorRawLine = line;
+        } else if (line.includes("ERROR") && line.includes("timed out")) {
+          errors.add("read_timeout");
+          lastErrorRawLine = line;
+        } else if (line.includes("ERROR") && line.includes("HTTPSConnectionPool")) {
+          errors.add("read_timeout");
+          lastErrorRawLine = line;
+        }
+      }
+    }
+  }
+
+  const last200StaleMs = last200Time > 0 ? (now - last200Time) : 0;
+
+  const header =
+    `🏥 <b>${HOSPITAL_NAME}</b>\n` +
+    `📋 รหัส: <b>${HOSPITAL_CODE}</b>\n` +
+    `📍 จังหวัด: <b>${PROVINCE}</b>\n` +
+    `⏰ เวลา: ${new Date().toLocaleString("th-TH", { timeZone: "Asia/Bangkok" })}\n` +
+    `${"─".repeat(30)}\n`;
+
+  // ── Case 1: No data logged for 30 minutes ──
+  const isLagging = last200Time > 0 && last200StaleMs > WATCHDOG_NO200_THRESHOLD_MS;
+  if (isLagging) {
+    const lastAlert = state["last_lag_alert"] || 0;
+    if (now - lastAlert > WATCHDOG_DEDUP_WINDOW_MS) {
+      const minutesAgo = Math.round(last200StaleMs / 60000);
+      const msg =
+        `${header}` +
+        `🔴 <b>แจ้งเตือน: ข้อมูลขาดหายเกิน 30 นาที</b>\n\n` +
+        `ไม่มีข้อมูลส่งสำเร็จใน 30 นาที\n` +
+        `เวลาล่าสุดที่เชื่อมต่อสำเร็จ: ${new Date(last200Time).toLocaleString("th-TH", { timeZone: "Asia/Bangkok" })}\n` +
+        `ขาดช่วงมาแล้ว: ~${minutesAgo} นาที\n\n` +
+        `⚠️ กรุณาตรวจสอบ Wazuh Agent หรือระบบเครือข่าย`;
+      await sendTelegramAlert(msg);
+      state["last_lag_alert"] = now;
+      console.log("[soc-watchdog] Sent lag alert");
+    }
+  } else if (last200Time > 0 && last200StaleMs <= WATCHDOG_NO200_THRESHOLD_MS) {
+    state["last_lag_alert"] = 0;
+  }
+
+  // ── Case 2: Error / 502 / Timeout detected ──
+  for (const errKey of errors) {
+    const stateKey = `last_err_${errKey}`;
+    const lastAlert = state[stateKey] || 0;
+    if (now - lastAlert > WATCHDOG_DEDUP_WINDOW_MS) {
+      const msg =
+        `${header}` +
+        `🔴 <b>แจ้งเตือน: ไม่สามารถติดต่อจากส่วนกลางได้</b>\n\n` +
+        `รหัสโรงพยาบาล: <b>${HOSPITAL_CODE}</b>\n` +
+        `ชื่อโรงพยาบาล: <b>${HOSPITAL_NAME}</b>\n` +
+        `แจ้ง: ไม่สามารถติดต่อจากส่วนกลางได้\n\n` +
+        `<i>${lastErrorRawLine.length > 200 ? lastErrorRawLine.substring(0, 200) + '...' : lastErrorRawLine}</i>`;
+      await sendTelegramAlert(msg);
+      state[stateKey] = now;
+      console.log(`[soc-watchdog] Sent error alert: ${errKey}`);
+    }
+  }
+
+  await saveWatchdogState(state);
+}
+
+// Start watchdog — run immediately once, then every 5 minutes
+console.log("🐕 SOC Watchdog started (check every 5 min, alert via Telegram)");
+runSocWatchdog().catch(err => console.error("[soc-watchdog] Initial run error:", err));
+setInterval(() => {
+  runSocWatchdog().catch(err => console.error("[soc-watchdog] Error:", err));
+}, WATCHDOG_CHECK_INTERVAL_MS);
