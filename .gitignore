@@ -6,6 +6,9 @@ node_modules/
 Flow_Script.md
 test.ts
 out/suricata/rules/*.rules
-suricata/log/
-suricata/logs/
+suricata/.env
+suricata/log/*
+!suricata/log/.gitkeep
+suricata/rules/*
+!suricata/rules/.gitkeep
 .device_id

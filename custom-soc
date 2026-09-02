@@ -11,7 +11,7 @@ from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
  
 # ============================================================================
-# Load .env อัพเดท lv รับตั้งแต่ lv 3 update .device_id
+# Load .env อัพเดท lv รับตั้งแต่ lv 7 update .device_id 310869
 # ============================================================================
 
 ENV_FILE = "/var/hos-edge-connector/.env"
@@ -77,6 +77,7 @@ API_BASE = env.get(
 
 API_URL = f"{API_BASE}/alerts"
 MALWARE_API_URL = f"{API_BASE}/malware-events"
+WINDOWS_ERROR_API_URL = f"{API_BASE}/windows-errors"
 
 API_KEY = env.get("API_KEY", "")
 HOSPITAL_CODE = env.get("HOSPITAL_CODE", "")
@@ -117,46 +118,10 @@ EXCLUDED_RULE_IDS = {
     "750",
     "751",
     "752",
-    "44600",
-    "44613",
-    "44615",
-    "44616",
-    "44618",
-    "44619",
-    "44622",
-    "44627",
-    "44630",
-    "81600",
-    "81601",
-    "81602",
-    "81603",
-    "81604",
-    "81606",
-    "81612",
-    "81614",
-    "81616",
-    "81617",
-    "81618",
-    "81619",
-    "81620",
-    "81622",
-    "81624",
-    "81625",
-    "81626",
-    "81631",
-    "81633",
-    "81634",
-    "81636",
-    "81637",
-    "81640",
-    "81642",
-    "92032",
     "92200",
-    "92910",
-    "100650",
-    "100652",
-    "120063"
 }
+# 120063 now visible for CSV Phase - was hidden before, CSV needs it as marker
+CSV_VISIBLE_RULES = {"120063","120113","120110","120111","120112"}
 
 _env_excluded = env.get("EXCLUDED_RULE_IDS", "")
 if _env_excluded:
@@ -318,30 +283,38 @@ def main():
     ):
         report_malware_event(alert, full_log)
 
-    if level >= 3:
+    # Phase4: Operational Diagnostics Noise Separation Router
+    WINDOWS_ERROR_RULE_IDS = {"60600","60602","60100","60101","61110"}
+    is_windows_error = rule_id in WINDOWS_ERROR_RULE_IDS or rule_id.startswith("6060") or "windows_system_error" in groups or "windows_error" in groups
 
+    # Anti-bottleneck: drop noise early (whitelist/fp_filter never send)
+    if "whitelist" in groups or "fp_filter" in groups:
+        return
+    # Chain-aware lv filter: >=7 = keep C2/ransomware/cred dump, drop 130001/110001/110540 noise
+    # low lv markers (120090 lv3,120710 lv4) not needed centrally — correlation lv12-15 still sent
+    if level >= 7:
         payload = alert.copy()
-
         payload["hospital_code"] = HOSPITAL_CODE
         payload["hospital_name"] = HOSPITAL_NAME
 
+        target_url = WINDOWS_ERROR_API_URL if is_windows_error else API_URL
+        tag = "windows-error" if is_windows_error else "custom-soc"
+
         try:
             r = requests.post(
-                API_URL,
+                target_url,
                 json=payload,
                 headers=HEADERS,
                 timeout=10,
                 verify=False
             )
-
             if r.status_code == 200:
-                write_log(f"[custom-soc] rule={rule_id} level={level} -> HTTP 200 OK")
+                write_log(f"[{tag}] rule={rule_id} level={level} -> HTTP 200 OK ({'noise separated' if is_windows_error else 'security'})")
             else:
-                error_msg = f"[custom-soc] rule={rule_id} level={level} -> HTTP {r.status_code}"
-                write_log(error_msg)
+                write_log(f"[{tag}] rule={rule_id} level={level} -> HTTP {r.status_code}")
 
         except Exception as e:
-            write_log(f"[custom-soc] ERROR rule={rule_id}: {e}")
+            write_log(f"[{tag}] ERROR rule={rule_id}: {e}")
 
 
 

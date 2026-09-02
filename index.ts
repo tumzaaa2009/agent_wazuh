@@ -578,7 +578,7 @@ async function getHardwareId(): Promise<string> {
         const hwid = await file.text();
         if (hwid.trim()) return hwid.trim();
       }
-    } catch {}
+    } catch { }
   }
   return "unknown";
 }
@@ -700,3 +700,164 @@ runSocWatchdog().catch(err => console.error("[soc-watchdog] Initial run error:",
 setInterval(() => {
   runSocWatchdog().catch(err => console.error("[soc-watchdog] Error:", err));
 }, WATCHDOG_CHECK_INTERVAL_MS);
+
+// ---------------------------------------------------------
+// Wazuh Health & Agent Traffic Monitor
+// ---------------------------------------------------------
+async function checkWazuhHealthAndTraffic(isManualTest = false) {
+  // Ignore self-signed certs for local indexer
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+  if (!INDEXER_URL || !INDEXER_USER || !INDEXER_PASSWORD) {
+    console.error("⚠️ Skipping Wazuh Health Check: INDEXER credentials missing.");
+    return;
+  }
+  console.log(INDEXER_URL, INDEXER_USER, INDEXER_PASSWORD)
+  console.log(`\n📊 Starting ${isManualTest ? "Manual " : "Daily "}Wazuh Health & Agent Traffic Check...`);
+
+  try {
+    const authHeader = "Basic " + Buffer.from(`${INDEXER_USER}:${INDEXER_PASSWORD}`).toString("base64");
+
+    // 1. Check Cluster Health
+    let clusterHealth = "unknown";
+    try {
+      const healthRes = await fetch(`${INDEXER_URL}/_cluster/health`, {
+        headers: { "Authorization": authHeader },
+      });
+      if (healthRes.ok) {
+        const healthData = await healthRes.json();
+        clusterHealth = healthData.status; // green, yellow, red
+        console.log(`✅ Wazuh Cluster Health: ${clusterHealth}`);
+      } else {
+        console.error("❌ Wazuh Cluster Health returned status:", healthRes.status);
+      }
+    } catch (err: any) {
+      console.error("❌ Failed to fetch Wazuh cluster health:", err.message);
+    }
+
+    // 2. Fetch Agent Traffic (Top 5 rule.id per agent)
+    let agentTraffic: any[] = [];
+    try {
+      // For manual tests (during the day), we get "today's" data from 00:00 to now.
+      // For midnight cron runs, we get "yesterday's" full 24h data (00:00 to 23:59:59).
+      const gteTime = isManualTest ? "now/d" : "now-1d/d";
+      const ltTime = isManualTest ? "now" : "now/d";
+
+      const query = {
+        "size": 0,
+        "query": {
+          "range": {
+            "timestamp": {
+              "gte": gteTime,
+              "lt": ltTime
+            }
+          }
+        },
+        "aggs": {
+          "agents": {
+            "terms": { "field": "agent.id", "size": 1000 },
+            "aggs": {
+              "agent_name": {
+                "terms": { "field": "agent.name", "size": 1 }
+              },
+              "last_log": {
+                "max": { "field": "timestamp" }
+              },
+              "top_rules": {
+                "terms": { "field": "rule.id", "size": 5 }
+              }
+            }
+          }
+        }
+      };
+
+      const trafficRes = await fetch(`${INDEXER_URL}/wazuh-alerts-*/_search`, {
+        method: "POST",
+        headers: {
+          "Authorization": authHeader,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(query)
+      });
+
+      if (trafficRes.ok) {
+        const trafficData = await trafficRes.json();
+        const buckets = trafficData.aggregations?.agents?.buckets || [];
+
+        agentTraffic = buckets.map((agentBucket: any) => {
+          const topRules = (agentBucket.top_rules?.buckets || []).map((ruleBucket: any) => ({
+            rule_id: ruleBucket.key,
+            count: ruleBucket.doc_count
+          }));
+          
+          const agentName = agentBucket.agent_name?.buckets?.[0]?.key || "unknown";
+          
+          let lastLog = "unknown";
+          if (agentBucket.last_log?.value) {
+            // แปลงจาก UTC เป็นเวลาไทย (Asia/Bangkok) ในรูปแบบ YYYY-MM-DD HH:mm:ss
+            lastLog = new Date(agentBucket.last_log.value).toLocaleString("sv-SE", { timeZone: "Asia/Bangkok" });
+          }
+
+          return {
+            agent_id: agentBucket.key,
+            agent_name: agentName,
+            total_logs: agentBucket.doc_count,
+            last_log_time: lastLog,
+            top_rules: topRules
+          };
+        });
+        console.log(`✅ Agent Traffic Collected: Found ${agentTraffic.length} agents reporting logs.`);
+      } else {
+        console.error("❌ Failed to fetch Wazuh agent traffic. Status:", trafficRes.status);
+      }
+    } catch (err: any) {
+      console.error("❌ Failed to fetch Wazuh agent traffic:", err.message);
+    }
+
+    // Prepare the final payload
+    const reportData = {
+      timestamp: new Date().toISOString(),
+      hospital_code: HOSPITAL_CODE,
+      cluster_health: clusterHealth,
+      agent_traffic: agentTraffic
+    };
+
+    // Print formatted log
+    console.log(`\n📈 Wazuh Health & Traffic Report payload:\n${JSON.stringify(reportData, null, 2)}\n`);
+
+    // Write to a local log file for record keeping
+    await import("fs/promises").then(fs =>
+      fs.appendFile("/var/ossec/logs/wazuh-health-traffic.log", JSON.stringify(reportData) + "\n")
+    ).catch((err) => console.error("❌ Failed to write traffic log:", err.message));
+
+    // TODO: Send data to Central SOC API/WebSocket (to be implemented after manual testing)
+
+  } catch (err: any) {
+    console.error("❌ Error in checkWazuhHealthAndTraffic:", err);
+  }
+}
+
+// Schedule Manual Test to run 10 seconds after script startup
+setTimeout(() => {
+  checkWazuhHealthAndTraffic(true);
+}, 10000);
+
+// Schedule Daily Execution at Midnight
+function scheduleMidnightRun() {
+  const now = new Date();
+  const nextMidnight = new Date();
+  nextMidnight.setHours(24, 0, 0, 0); // Next midnight
+  const msUntilMidnight = nextMidnight.getTime() - now.getTime();
+
+  console.log(`⏳ Next daily Wazuh traffic check scheduled in ${Math.round(msUntilMidnight / 60000)} minutes (at Midnight).`);
+
+  setTimeout(() => {
+    checkWazuhHealthAndTraffic(false);
+    // Re-schedule for the next midnight after this one runs
+    setInterval(() => {
+      checkWazuhHealthAndTraffic(false);
+    }, 24 * 60 * 60 * 1000); // exactly 24 hours later
+  }, msUntilMidnight);
+}
+
+scheduleMidnightRun();
