@@ -18,7 +18,10 @@ log_json() {
 }
 
 # --- read alert JSON from stdin (robust: jq -> python3 -> grep fallback) ---
-ALERT=$(cat)
+ALERT=""
+if [ ! -t 0 ]; then
+  ALERT=$(cat)
+fi
 extract() {
   local key="$1" val=""
   if command -v jq >/dev/null 2>&1; then
@@ -78,12 +81,12 @@ except Exception:
 PYEOF
 }
 
-# Choose blocking target: prefer external C2 destination; fallback to srcip
+# Choose blocking target: prefer external C2 destination; fallback to public srcip
 BLOCKIP=""
 if [ -n "$DSTIP" ] && [ "$DSTIP" != "null" ] && [ "$(is_public "$DSTIP")" = "1" ]; then
   BLOCKIP="$DSTIP"        # external C2 server
-elif [ -n "$SRCIP" ] && [ "$SRCIP" != "null" ] && [ "$SRCIP" != "127.0.0.1" ]; then
-  BLOCKIP="$SRCIP"        # internal compromised host talking to C2
+elif [ -n "$SRCIP" ] && [ "$SRCIP" != "null" ] && [ "$(is_public "$SRCIP")" = "1" ]; then
+  BLOCKIP="$SRCIP"        # external C2 source IP
 fi
 
 [ -z "$BLOCKIP" ] && { log_json "${ACTION}" "none" "${RULEID}" "SKIP"; log_end; exit 0; }
@@ -104,6 +107,19 @@ fi
 while IFS= read -r ns; do
     [[ -n "$ns" && "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && REGULATOR_SAFE_IPS+=("$ns")
 done < <(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+
+# Discover Wazuh Manager / Cluster to prevent accidental C2 block
+while IFS= read -r mgr; do
+    if [ -n "$mgr" ]; then
+        if [[ "$mgr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            REGULATOR_SAFE_IPS+=("$mgr")
+        else
+            while IFS= read -r rip; do
+                [ -n "$rip" ] && REGULATOR_SAFE_IPS+=("$rip")
+            done < <(getent ahostsv4 "$mgr" 2>/dev/null | awk '{print $1}' | sort -u)
+        fi
+    fi
+done < <(grep -oP '<address>\K[^<]+' /var/ossec/etc/ossec.conf 2>/dev/null || true)
 
 for safe_ip in "${REGULATOR_SAFE_IPS[@]}"; do
     if [ "$BLOCKIP" = "$safe_ip" ]; then

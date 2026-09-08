@@ -40,9 +40,17 @@ while IFS= read -r cidr; do
     [ -n "$cidr" ] && LOCAL_SUBNETS+=("$cidr")
 done < <(ip -o -f inet addr show 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|169\.254\.)' | sort -u)
 
-# 4. Discover Wazuh Manager / Cluster Addresses from config
+# 4. Discover Wazuh Manager / Cluster Addresses from config (IP or Domain)
 while IFS= read -r mgr; do
-    [[ -n "$mgr" && "$mgr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && DYNAMIC_ALLOW_IPS+=("$mgr")
+    if [ -n "$mgr" ]; then
+        if [[ "$mgr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            DYNAMIC_ALLOW_IPS+=("$mgr")
+        else
+            while IFS= read -r rip; do
+                [ -n "$rip" ] && DYNAMIC_ALLOW_IPS+=("$rip")
+            done < <(getent ahostsv4 "$mgr" 2>/dev/null | awk '{print $1}' | sort -u)
+        fi
+    fi
 done < <(grep -oP '<address>\K[^<]+' /var/ossec/etc/ossec.conf 2>/dev/null || true)
 
 # 5. Discover DNS Nameservers
@@ -64,13 +72,23 @@ if ! command -v iptables >/dev/null 2>&1; then
 fi
 
 ACTION="$1"
-if [ -z "$ACTION" ]; then
+INPUT=""
+if [ ! -t 0 ]; then
     INPUT=$(cat)
-    if [ -n "$INPUT" ]; then
-        ACTION=$(echo "$INPUT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('command', 'add'))" 2>/dev/null || echo "add")
-    else
-        ACTION="add"
-    fi
+fi
+
+if [ -n "$INPUT" ]; then
+    ACTION_FROM_JSON=$(echo "$INPUT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('command', ''))" 2>/dev/null || true)
+    [ -n "$ACTION_FROM_JSON" ] && ACTION="$ACTION_FROM_JSON"
+fi
+[ -z "$ACTION" ] && ACTION="add"
+
+# Safeguard: Do not isolate Manager if alert originated from a remote agent
+ALERT_AGENT_ID=$(echo "$INPUT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('parameters',{}).get('alert',{}).get('agent',{}).get('id','000'))" 2>/dev/null || echo "000")
+if [ "$ALERT_AGENT_ID" != "000" ] && [ -f /var/ossec/bin/wazuh-analysisd ]; then
+    log_line "Safeguard: Skipped isolate-host on Manager for remote agent.id=$ALERT_AGENT_ID."
+    log_end
+    exit 0
 fi
 
 if [ "$ACTION" = "add" ]; then
