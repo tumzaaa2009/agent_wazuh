@@ -54,6 +54,8 @@ if [ -z "$FILEPATH" ] || [ "$FILEPATH" == "null" ]; then
     logger -p local6.err -t wazuh_yara -- \
     "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"no_file_path\"}"
     exit 0
+fi
+
 ALERT_AGENT_ID=$(json_extract '.parameters.alert.agent.id // empty')
 if [ -n "$ALERT_AGENT_ID" ] && [ "$ALERT_AGENT_ID" != "000" ] && [ -f "/var/ossec/bin/wazuh-analysisd" ]; then
     echo "$(date -Is) yara.sh: [INFO] SKIP_REMOTE_AGENT: File path belongs to agent $ALERT_AGENT_ID, skipping local manager scan." >> "$LOGFILE"
@@ -89,15 +91,28 @@ fi
 
 echo "$(date -Is) yara.sh: [INFO] SCAN_START file=$ABS_FILE size=${FILE_SIZE_BYTES}B" >> "$LOGFILE"
 
-YARA_RULES_COMPILED="/var/ossec/etc/shared/default/yara_rules.yc"
-YARA_RULES="/var/ossec/etc/shared/default/yara_rules.yar"
+YARA_RULES_COMPILED=""
+for cand in "/var/ossec/etc/shared/yara_rules.yc" "/var/ossec/etc/shared/default/yara_rules.yc"; do
+    if [ -f "$cand" ]; then
+        YARA_RULES_COMPILED="$cand"
+        break
+    fi
+done
+
+YARA_RULES=""
+for cand in "/var/ossec/etc/shared/yara_rules.yar" "/var/ossec/etc/shared/default/yara_rules.yar"; do
+    if [ -f "$cand" ]; then
+        YARA_RULES="$cand"
+        break
+    fi
+done
 
 YARA_BIN=$(command -v yara 2>/dev/null || echo "/usr/bin/yara")
 [ ! -x "$YARA_BIN" ] && [ -x "/usr/bin/yara" ] && YARA_BIN="/usr/bin/yara"
 
-if [ -f "$YARA_RULES_COMPILED" ]; then
+if [ -n "$YARA_RULES_COMPILED" ]; then
     YARA_CMD="$YARA_BIN -C $YARA_RULES_COMPILED"
-elif [ -f "$YARA_RULES" ]; then
+elif [ -n "$YARA_RULES" ]; then
     YARA_CMD="$YARA_BIN -r $YARA_RULES"
 else
     echo "$(date -Is) yara.sh: [ERROR] YARA rules not found." >> "$LOGFILE"
