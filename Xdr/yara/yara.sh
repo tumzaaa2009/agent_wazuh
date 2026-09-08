@@ -4,13 +4,14 @@
 # ติดตั้งที่: /var/ossec/active-response/bin/yara.sh
 # =============================================================
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 LOGFILE="/var/ossec/logs/active-responses.log"
 MAX_SCAN_SIZE_MB="${YARA_MAX_SCAN_SIZE_MB:-100}"
 
 echo "$(date '+%Y/%m/%d %H:%M:%S') /var/ossec/active-response/bin/yara.sh: Starting" >> "$LOGFILE"
 
 read INPUT_JSON
-echo "$(date '+%Y/%m/%d %H:%M:%S') /var/ossec/active-response/bin/yara.sh: $INPUT_JSON" >> "$LOGFILE"
 
 json_extract() {
     local filter="$1"
@@ -53,6 +54,10 @@ if [ -z "$FILEPATH" ] || [ "$FILEPATH" == "null" ]; then
     logger -p local6.err -t wazuh_yara -- \
     "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"no_file_path\"}"
     exit 0
+ALERT_AGENT_ID=$(json_extract '.parameters.alert.agent.id // empty')
+if [ -n "$ALERT_AGENT_ID" ] && [ "$ALERT_AGENT_ID" != "000" ] && [ -f "/var/ossec/bin/wazuh-analysisd" ]; then
+    echo "$(date -Is) yara.sh: [INFO] SKIP_REMOTE_AGENT: File path belongs to agent $ALERT_AGENT_ID, skipping local manager scan." >> "$LOGFILE"
+    exit 0
 fi
 
 if [ ! -f "$FILEPATH" ]; then
@@ -84,23 +89,41 @@ fi
 
 echo "$(date -Is) yara.sh: [INFO] SCAN_START file=$ABS_FILE size=${FILE_SIZE_BYTES}B" >> "$LOGFILE"
 
-YARA_RULES="/var/ossec/etc/shared/yara_rules.yar"
-if [ ! -f "$YARA_RULES" ]; then
-    YARA_RULES="/var/ossec/etc/shared/default/yara_rules.yar"
-    if [ ! -f "$YARA_RULES" ]; then
-        echo "$(date -Is) yara.sh: [ERROR] YARA rules not found." >> "$LOGFILE"
-        logger -p local6.err -t wazuh_yara -- \
-        "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"rules_not_found\"}"
-        exit 1
-    fi
+YARA_RULES_COMPILED="/var/ossec/etc/shared/default/yara_rules.yc"
+YARA_RULES="/var/ossec/etc/shared/default/yara_rules.yar"
+
+YARA_BIN=$(command -v yara 2>/dev/null || echo "/usr/bin/yara")
+[ ! -x "$YARA_BIN" ] && [ -x "/usr/bin/yara" ] && YARA_BIN="/usr/bin/yara"
+
+if [ -f "$YARA_RULES_COMPILED" ]; then
+    YARA_CMD="$YARA_BIN -C $YARA_RULES_COMPILED"
+elif [ -f "$YARA_RULES" ]; then
+    YARA_CMD="$YARA_BIN -r $YARA_RULES"
+else
+    echo "$(date -Is) yara.sh: [ERROR] YARA rules not found." >> "$LOGFILE"
+    logger -p local6.err -t wazuh_yara -- \
+    "{\"event\":\"yara\",\"action\":\"error\",\"level\":\"ERROR\",\"reason\":\"rules_not_found\"}"
+    exit 1
 fi
 
-echo "$(date -Is) yara.sh: [INFO] Waiting 2s for IO sync..." >> "$LOGFILE"
-sleep 2
+echo "$(date -Is) yara.sh: [INFO] Waiting 1s for IO sync..." >> "$LOGFILE"
+sleep 1
 
-echo "$(date -Is) yara.sh: [DEBUG] Executing YARA scan..." >> "$LOGFILE"
+RUNNING_SCANS=$(pgrep -x "yara" 2>/dev/null | wc -l)
+RUNNING_SCANS="${RUNNING_SCANS:-0}"
+if [ "$RUNNING_SCANS" -ge 5 ]; then
+    echo "$(date -Is) yara.sh: [INFO] SKIP: Max concurrent YARA scans ($RUNNING_SCANS) reached. Throttling to protect system performance." >> "$LOGFILE"
+    exit 0
+fi
 
-YARA_RESULT=$(yara -r "$YARA_RULES" "$ABS_FILE" 2>&1)
+echo "$(date -Is) yara.sh: [DEBUG] Executing YARA scan with lowest CPU/IO priority (nice/ionice)..." >> "$LOGFILE"
+
+# Execute with lowest CPU priority (nice -n 19) and lowest disk I/O priority (ionice -c 3)
+if command -v ionice >/dev/null 2>&1; then
+    YARA_RESULT=$(nice -n 19 ionice -c 3 $YARA_CMD "$ABS_FILE" 2>&1)
+else
+    YARA_RESULT=$(nice -n 19 $YARA_CMD "$ABS_FILE" 2>&1)
+fi
 EXIT_CODE=$?
 
 echo "$(date -Is) yara.sh: [DEBUG] YARA execution finished. Exit Code: $EXIT_CODE" >> "$LOGFILE"
@@ -115,12 +138,24 @@ if [ -n "$CLEAN_YARA_RESULT" ] && [ "$EXIT_CODE" -eq 0 ]; then
 
     if [ -z "$SRC_IP" ] && [ -n "$AUDIT_PID" ] && [ "$AUDIT_PID" != "null" ]; then
         SRC_IP=$(ss -tnp 2>/dev/null | grep -E "pid=($AUDIT_PID|$AUDIT_PPID)," | awk '{print $5}' | cut -d: -f1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        if [ -z "$SRC_IP" ] && [ -r "/proc/$AUDIT_PID/environ" ]; then
+            SRC_IP=$(tr '\0' '\n' < "/proc/$AUDIT_PID/environ" 2>/dev/null | grep -E '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
+        fi
+        if [ -z "$SRC_IP" ] && [ -n "$AUDIT_PPID" ] && [ -r "/proc/$AUDIT_PPID/environ" ]; then
+            SRC_IP=$(tr '\0' '\n' < "/proc/$AUDIT_PPID/environ" 2>/dev/null | grep -E '^SSH_CLIENT=' | cut -d= -f2 | awk '{print $1}')
+        fi
     fi
     if [ -z "$SRC_IP" ] && [ "$DETECT_USER" != "N/A" ]; then
         SRC_IP=$(who 2>/dev/null | grep "^$DETECT_USER" | awk '{print $5}' | tr -d '()' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         [ -z "$SRC_IP" ] && SRC_IP=$(last -n 10 "$DETECT_USER" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
     fi
-    [ -z "$SRC_IP" ] && SRC_IP="N/A"
+    if [ -z "$SRC_IP" ] && [ -n "$SSH_CLIENT" ]; then
+        SRC_IP=$(echo "$SSH_CLIENT" | awk '{print $1}')
+    fi
+    if [ -z "$SRC_IP" ]; then
+        SRC_IP=$(ss -tn '( sport = :22 or sport = :80 or sport = :443 )' 2>/dev/null | awk 'NR>1 {print $5}' | cut -d: -f1 | grep -vE '^(127\.|::1|0\.0\.0\.0)' | head -n 1)
+    fi
+    [ -z "$SRC_IP" ] && SRC_IP="127.0.0.1"
 
     echo "$(date -Is) yara.sh: [WARN] MALWARE_DETECTED file=$FILENAME result=$CLEAN_YARA_RESULT src_ip=$SRC_IP user=$DETECT_USER" >> "$LOGFILE"
 

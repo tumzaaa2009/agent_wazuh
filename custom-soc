@@ -11,7 +11,7 @@ from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
  
 # ============================================================================
-# Load .env อัพเดท lv รับตั้งแต่ lv 7 update .device_id 310869
+#  Owsap
 # ============================================================================
 
 ENV_FILE = "/var/hos-edge-connector/.env"
@@ -290,15 +290,63 @@ def main():
     # Anti-bottleneck: drop noise early (whitelist/fp_filter never send)
     if "whitelist" in groups or "fp_filter" in groups:
         return
-    # Chain-aware lv filter: >=7 = keep C2/ransomware/cred dump, drop 130001/110001/110540 noise
-    # low lv markers (120090 lv3,120710 lv4) not needed centrally — correlation lv12-15 still sent
-    if level >= 7:
+
+    # Check OWASP & Web Application Attacks (SQLi, XSS, Path Traversal, File Inclusion, etc.)
+    WEB_OWASP_GROUPS = {"web", "web_scan", "web_appsec", "sql_injection", "xss", "rce", "attack"}
+    is_web_owasp = (
+        bool(set(groups) & WEB_OWASP_GROUPS)
+        or rule_id.startswith("311")
+        or rule_id.startswith("315")
+        or "owasp" in description.lower()
+        or "sql injection" in description.lower()
+        or "xss" in description.lower()
+        or "traversal" in description.lower()
+    )
+
+    # Chain-aware lv filter: >=7 = keep C2/ransomware/cred dump, drop noise. Always allow OWASP & Critical Web Attacks
+    if level >= 7 or is_web_owasp:
         payload = alert.copy()
         payload["hospital_code"] = HOSPITAL_CODE
         payload["hospital_name"] = HOSPITAL_NAME
 
-        target_url = WINDOWS_ERROR_API_URL if is_windows_error else API_URL
-        tag = "windows-error" if is_windows_error else "custom-soc"
+        # Extract Key Security Fields for Central SOC Dashboards & Triage
+        data = alert.get("data", {})
+        win = alert.get("win", {})
+        eventdata = win.get("eventdata", {}) if isinstance(win, dict) else {}
+
+        # 1. Source & Destination IP
+        src_ip = alert.get("srcip") or (data.get("srcip") if isinstance(data, dict) else None) or eventdata.get("sourceIp")
+        dest_ip = alert.get("dstip") or (data.get("dstip") if isinstance(data, dict) else None) or eventdata.get("destinationIp")
+        if src_ip:
+            payload["src_ip"] = src_ip
+        if dest_ip:
+            payload["dest_ip"] = dest_ip
+
+        # 2. MITRE ATT&CK Context
+        mitre = rule.get("mitre", {})
+        if mitre:
+            payload["mitre"] = mitre
+
+        # 3. File & Process IoC Context
+        filepath = None
+        if alert.get("syscheck", {}).get("path"):
+            filepath = alert["syscheck"]["path"]
+        elif eventdata.get("targetFilename"):
+            filepath = eventdata["targetFilename"]
+        elif eventdata.get("image"):
+            filepath = eventdata["image"]
+
+        if filepath:
+            payload["file_path"] = filepath
+            payload["file_name"] = filepath.replace("\\", "/").split("/")[-1]
+
+        # 4. OWASP Classification Flag
+        if is_web_owasp:
+            payload["attack_type"] = "OWASP_Web_Attack"
+
+        # Routing: Default to API_URL (fallback if windows-errors endpoint gives 404)
+        target_url = API_URL
+        tag = "custom-soc"
 
         try:
             r = requests.post(
@@ -308,8 +356,8 @@ def main():
                 timeout=10,
                 verify=False
             )
-            if r.status_code == 200:
-                write_log(f"[{tag}] rule={rule_id} level={level} -> HTTP 200 OK ({'noise separated' if is_windows_error else 'security'})")
+            if r.status_code in (200, 201):
+                write_log(f"[{tag}] rule={rule_id} level={level} -> HTTP {r.status_code} OK ({'OWASP' if is_web_owasp else 'security'})")
             else:
                 write_log(f"[{tag}] rule={rule_id} level={level} -> HTTP {r.status_code}")
 

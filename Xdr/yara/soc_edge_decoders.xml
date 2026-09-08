@@ -1,0 +1,104 @@
+<!-- ================================================================ -->
+<!-- SOC Edge Decoder                                      -->
+<!-- Namespace 100xxx / 110xxx / 115xxx (ไม่ชนกับ default rules)  27/08-->
+<!-- [FIXED 2026-08-31] see inline notes -->
+<!-- ================================================================ -->
+<decoder name="yara_ar_header">
+    <prematch>active-response/bin/</prematch>
+</decoder>
+<decoder name="yara_json">
+    <parent>yara_ar_header</parent>
+    <prematch>^{"wazuh_yara":</prematch>
+    <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+<decoder name="yara_json_direct">
+    <prematch>^{"wazuh_yara":</prematch>
+    <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+
+<decoder name="eset-json">
+  <prematch>^{"event_type":</prematch>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+
+<!-- ======================================================= -->
+<!-- Wazuh YARA Active Response Decoder                      -->
+<!-- ======================================================= -->
+<decoder name="wazuh-yara-progname">
+  <program_name>wazuh-yara</program_name>
+</decoder>
+
+<decoder name="wazuh-yara-fields">
+  <parent>wazuh-yara-progname</parent>
+  <regex>src=(\S+)\s+dest=(\S+)\s+sha256=(\S+)\s+md5=(\S+)\s+yara_match=(\S+)\s+src_ip=(\S+)\s+user=(\S+)</regex>
+  <order>file, status, sha256, md5, yara_rule, srcip, dstuser</order>
+</decoder>
+
+<!-- Fallback กรณี log เดิมหรือไม่มี src_ip/user -->
+<decoder name="wazuh-yara-fields-fallback">
+  <parent>wazuh-yara-progname</parent>
+  <regex>src=(\S+)\s+dest=(\S+)\s+sha256=(\S+)\s+md5=(\S+)\s+yara_match=(\S+)</regex>
+  <order>file, status, sha256, md5, yara_rule</order>
+</decoder>
+
+<!-- Custom decoder to force JSON decoding for testing -->
+<decoder name="soc_json">
+  <prematch>^{"win":</prematch>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+
+<!-- Merged from sysmon_hash_decoder.xml -->
+<decoder name="sysmon_json_hash">
+  <parent>json</parent>
+  <regex>SHA256=([A-Fa-f0-9]+)</regex>
+  <order>sha256</order>
+</decoder>
+
+<!-- ======================================================= -->
+<!-- PHASE1: Sysmon Full Context Decoders (Task1)               -->
+<!-- Extract Image/CommandLine/ParentImage/ParentCmd/Hashes     -->
+<!-- Use parent=json (built-in) to avoid forward-reference; soc_json already decodes json -->
+<!-- ======================================================= -->
+<decoder name="soc_sysmon_process_create">
+  <parent>json</parent>
+  <regex>ProviderName: Microsoft-Windows-Sysmon.*EventID: 1.*Image: '([^']+)'.*CommandLine: '([^']*)'.*ParentImage: '([^']*)'.*ParentCommandLine: '([^']*)'.*Hashes: '([^']*)'</regex>
+  <order>win.eventdata.image, win.eventdata.commandLine, win.eventdata.parentImage, win.eventdata.parentCommandLine, win.eventdata.hashes</order>
+</decoder>
+<decoder name="soc_sysmon_signature">
+  <parent>json</parent>
+  <regex>Signed: '([^']*)'.*SignatureStatus: '([^']*)'.*Signature: '([^']*)'</regex>
+  <order>win.eventdata.signed, win.eventdata.signatureStatus, win.eventdata.signature</order>
+</decoder>
+
+<!-- ===== SOC oxAlph C2 DEFENSE (merged from soc_c2_decoders.xml) ===== -->
+<!-- AR feedback lines are decoded by built-in 'ar_log_json' decoder - see rules 136040/136041 -->
+
+<!-- ======================================================= -->
+<!-- PHASE CSV: CSV Injection Decoders (2026-08-30)          -->
+<!-- Extract ParentImage context for office->cmd/powershell -->
+<!-- ======================================================= -->
+<decoder name="soc_sysmon_csv_office_parent">
+  <parent>json</parent>
+  <regex>ParentImage: '([^']*EXCEL[^']*)'.*Image: '([^']*cmd[^']*)'</regex>
+  <order>win.eventdata.csv_parentOffice, win.eventdata.csv_childLolbin</order>
+</decoder>
+<decoder name="soc_sysmon_csv_office_parent_pwsh">
+  <parent>json</parent>
+  <regex>ParentImage: '([^']*EXCEL[^']*)'.*Image: '([^']*powershell[^']*)'</regex>
+  <order>win.eventdata.csv_parentOffice, win.eventdata.csv_childLolbin</order>
+</decoder>
+<decoder name="soc_sysmon_csv_office_parent_libre">
+  <parent>json</parent>
+  <regex>ParentImage: '([^']*soffice[^']*)'</regex>
+  <order>win.eventdata.csv_parentOffice</order>
+</decoder>
+<decoder name="soc_csv_formula_content">
+  <parent>json</parent>
+  <regex>cmd\|.*!A0</regex>
+  <order>csv.formula_trigger</order>
+</decoder>
+<decoder name="soc_csv_import_content">
+  <parent>json</parent>
+  <regex>IMPORTXML|IMPORTDATA</regex>
+  <order>csv.formula_trigger</order>
+</decoder>

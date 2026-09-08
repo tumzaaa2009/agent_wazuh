@@ -60,8 +60,6 @@ RULEID=$(extract rule)
 ACTION=${1:-add}
 log_start
 
-# Choose blocking target: prefer external C2 destination; fallback to srcip
-BLOCKIP=""
 is_public() { python3 - "$1" <<'PYEOF' 2>/dev/null || echo 0
 import sys, ipaddress
 try:
@@ -80,6 +78,8 @@ except Exception:
 PYEOF
 }
 
+# Choose blocking target: prefer external C2 destination; fallback to srcip
+BLOCKIP=""
 if [ -n "$DSTIP" ] && [ "$DSTIP" != "null" ] && [ "$(is_public "$DSTIP")" = "1" ]; then
   BLOCKIP="$DSTIP"        # external C2 server
 elif [ -n "$SRCIP" ] && [ "$SRCIP" != "null" ] && [ "$SRCIP" != "127.0.0.1" ]; then
@@ -87,6 +87,32 @@ elif [ -n "$SRCIP" ] && [ "$SRCIP" != "null" ] && [ "$SRCIP" != "127.0.0.1" ]; t
 fi
 
 [ -z "$BLOCKIP" ] && { log_json "${ACTION}" "none" "${RULEID}" "SKIP"; log_end; exit 0; }
+
+# --- Dynamic Regulator Safeguard: Never block current SSH peers, Gateway, Local IPs, or DNS ---
+REGULATOR_SAFE_IPS=()
+[ -n "${SSH_CLIENT:-}" ] && REGULATOR_SAFE_IPS+=("$(echo "$SSH_CLIENT" | awk '{print $1}')")
+GW_IP=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1)
+[ -n "$GW_IP" ] && REGULATOR_SAFE_IPS+=("$GW_IP")
+while IFS= read -r if_ip; do
+    [ -n "$if_ip" ] && REGULATOR_SAFE_IPS+=("$if_ip")
+done < <(ip -o -f inet addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+if command -v ss >/dev/null 2>&1; then
+    while IFS= read -r p; do
+        [ -n "$p" ] && REGULATOR_SAFE_IPS+=("$p")
+    done < <(ss -tn sport = :22 2>/dev/null | awk 'NR>1 {print $5}' | cut -d: -f1 | grep -vE '^(127\.|0\.0\.0\.0|::)' | sort -u)
+fi
+while IFS= read -r ns; do
+    [[ -n "$ns" && "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && REGULATOR_SAFE_IPS+=("$ns")
+done < <(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+
+for safe_ip in "${REGULATOR_SAFE_IPS[@]}"; do
+    if [ "$BLOCKIP" = "$safe_ip" ]; then
+        log_json "${ACTION}" "${BLOCKIP}" "${RULEID}" "SKIP_REGULATOR_SAFEGUARD"
+        log_line "Regulator Safeguard: Target $BLOCKIP is protected Regulator infrastructure (SSH/GW/DNS/Local). Block skipped."
+        log_end
+        exit 0
+    fi
+done
 
 # --- duplicate guard: skip if already blocked ---
 if [ "$ACTION" = "add" ] && command -v iptables >/dev/null 2>&1; then

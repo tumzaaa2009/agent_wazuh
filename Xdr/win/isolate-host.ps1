@@ -1,47 +1,101 @@
-# SOC oxAlph - Active Response: isolate-host.ps1
-# Triggered by confirmed-ransomware rules (130002 / 136031 / 136035).
-# Network-isolates THIS host by blocking all outbound traffic except:
-#   - The Wazuh manager (keeps agent connectivity for further response)
-#   - Explicitly whitelisted SOC subnets ($socSubnets)
-# Does NOT require srcip from the alert - ransomware encrypts locally.
-# Logs in Wazuh standard convention (Starting / JSON / Ended).
+################################
+## Wazuh Active Response - Total Host Network Kill (Zero Exception)
+## 1. Disables all Network Adapters (Ethernet, Wi-Fi, Virtual)
+## 2. Sets IP to 1.1.1.1 / 255.255.255.255 (No Gateway)
+## 3. Total Firewall Block (All Inbound / Outbound)
+## 4. Releases IP, flushes DNS, ARP, and deletes default routes
+## Result: 100% offline, zero lateral spread, disconnected from Manager & LAN
+################################
 
-$ErrorActionPreference = 'SilentlyContinue'
-$AR_NAME      = "isolate-host.ps1"
-$LOG_FILE     = "$env:ProgramData\ossec-agent\active-response\active-responses.log"
+$ErrorActionPreference = "SilentlyContinue"
+$logFile = "C:\Program Files (x86)\ossec-agent\active-response\active-responses.log"
+$backupFile = "C:\Program Files (x86)\ossec-agent\active-response\network-backup.json"
 
-function Log-Line($msg) {
-    Add-Content -Path $LOG_FILE -Value "$(Get-Date -Format 'yyyy/MM/dd HH:mm:ss') active-response/bin/${AR_NAME}: $msg" -Encoding ascii
+$inputJson = [Console]::In.ReadLine()
+if ([string]::IsNullOrWhiteSpace($inputJson)) {
+    $inputJson = Read-Host
 }
-function Log-Json($action, $status) {
-    $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000Z')
-    $host_ = hostname
-    Log-Line "{`"version`":1,`"origin`":{`"name`":`"$host_`",`"module`":`"${AR_NAME}`"},`"command`":`"$action`",`"parameters`":{`"program`":`"isolate-host`",`"status`":`"$status`",`"timestamp`":`"$ts`"}}"
+if ([string]::IsNullOrWhiteSpace($inputJson)) { exit 0 }
+
+try {
+    $data = $inputJson | ConvertFrom-Json
+    if ($data -is [string]) { $data = $data | ConvertFrom-Json }
+} catch { exit 0 }
+
+$command = $data.command
+$rulePrefix = "Wazuh Total Isolation"
+
+if ($command -eq "add") {
+    # ─── 1. Backup รายชื่อ Adapter ก่อนสั่งปิด ───────────────────────────
+    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' }
+
+    $backupList = @()
+    foreach ($adapter in $adapters) {
+        $backupList += @{
+            Name = $adapter.Name
+            InterfaceDescription = $adapter.InterfaceDescription
+        }
+    }
+    $backupList | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding ascii -Force
+
+    # ─── 2. Windows Firewall Block ทั้งหมด 100% (ไม่มีข้อยกเว้น แม้กระทั่ง Manager) ──
+    Get-NetFirewallRule -DisplayName "$rulePrefix*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+    New-NetFirewallRule -DisplayName "$rulePrefix - Block All Inbound" `
+        -Direction Inbound -Action Block -LocalPort Any -Protocol Any -RemoteAddress Any
+
+    New-NetFirewallRule -DisplayName "$rulePrefix - Block All Outbound" `
+        -Direction Outbound -Action Block -LocalPort Any -Protocol Any -RemoteAddress Any
+
+    # ─── 3. เปลี่ยน IP เป็น 1.1.1.1 ตัด Gateway & DNS ───────────────────
+    foreach ($item in $backupList) {
+        $adapterName = $item.Name
+        & netsh interface ip set address name="$adapterName" source=static addr=1.1.1.1 mask=255.255.255.255
+        & netsh interface ip set dns name="$adapterName" source=static addr=127.0.0.1
+    }
+
+    # ─── 4. ล้าง Routing, ARP, DNS และ Release IP ───────────────────────
+    & ipconfig /release
+    & route delete 0.0.0.0
+    & arp -d *
+    & ipconfig /flushdns
+
+    # ─── 5. สั่ง Disable การ์ดจอ/การ์ดแลน/Wi-Fi ทุกตัวทันที (ตัดสายเน็ตระดับฮาร์ดแวร์) ─
+    Get-NetAdapter | Disable-NetAdapter -Confirm:$false
+
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - TOTAL NETWORK KILL: Disabled all NICs, Reset IP 1.1.1.1, Firewall Block All (ZERO EXCEPTION)" |
+    Out-File -FilePath $logFile -Append -Encoding ascii
+
 }
+elseif ($command -eq "delete") {
+    # ─── คืนค่า Network ทั้งหมดเมื่อสั่งปลดบล็อก ────────────────────────
+    # 1. Enable การ์ดแลน/Wi-Fi กลับคืนมา
+    Get-NetAdapter | Enable-NetAdapter -Confirm:$false
+    Start-Sleep -Seconds 2
 
-# ─── SOC management assets that must stay reachable ───
-$socSubnets   = @('192.168.36.0/24')          # ← ปรับตาม SOC subnet จริง
-$managerIPs   = @()                            # เติม Wazuh manager IP เพิ่มได้
+    # 2. ลบ Firewall Isolation Rules
+    Get-NetFirewallRule -DisplayName "$rulePrefix*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 
-Log-Line "Starting"
-Log-Json "add" "STARTED"
+    # 3. คืนค่า DHCP
+    if (Test-Path $backupFile) {
+        $backupList = Get-Content -Path $backupFile | ConvertFrom-Json
+        foreach ($item in $backupList) {
+            $adapterName = $item.Name
+            & netsh interface ip set address name="$adapterName" source=dhcp
+            & netsh interface ip set dns name="$adapterName" source=dhcp
+        }
+        Remove-Item -Path $backupFile -Force
+    }
+    else {
+        $allAdapters = Get-NetAdapter
+        foreach ($ad in $allAdapters) {
+            & netsh interface ip set address name="$($ad.Name)" source=dhcp
+            & netsh interface ip set dns name="$($ad.Name)" source=dhcp
+        }
+    }
 
-# 1) Enable Windows Firewall for all profiles (ensure enforcement)
-Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+    & ipconfig /renew
 
-# 2) Block ALL outbound by default
-New-NetFirewallRule -DisplayName "SOC-ISOLATE - Block All Outbound" `
-    -Direction Outbound -Action Block -Profile Any -Enabled True | Out-Null
-
-# 3) Allow outbound only to SOC subnets / manager
-foreach ($subnet in ($socSubnets + $managerIPs)) {
-    New-NetFirewallRule -DisplayName "SOC-ISOLATE - Allow $subnet" `
-        -Direction Outbound -Action Allow -RemoteAddress $subnet -Profile Any | Out-Null
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - RESTORED NETWORK: Enabled all NICs and restored DHCP" |
+    Out-File -FilePath $logFile -Append -Encoding ascii
 }
-
-# 4) Allow DNS to internal only (first allowed subnet's gateway assumed)
-Log-Line "ISOLATED: host network restricted to SOC subnets only"
-
-Log-Json "add" "ISOLATED"
-Log-Line "Ended"
-exit 0
