@@ -58,8 +58,10 @@ except Exception: print('')
 }
 
 SRCIP=$(extract srcip)
+[ -z "$SRCIP" ] && SRCIP="${3:-}"
 DSTIP=$(extract dstip)
 RULEID=$(extract rule)
+[ -z "$RULEID" ] && RULEID="AR_DROP"
 ACTION=${1:-add}
 log_start
 
